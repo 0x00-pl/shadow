@@ -1,0 +1,15 @@
+general:
+  stop_time: 5
+network:
+  graph:
+    type: 1_gbit_switch
+hosts:
+  testnode:
+    network_node_id: 0
+    processes:
+    - path: ../../target/debug/test_ipv6
+      # no --shadow-passing filter: all functionality tests run under shadow
+      # and are expected to fail until IPv6 is implemented; --summarize makes
+      # every failure visible instead of stopping at the first one
+      args: --summarize
+      start_time: 1

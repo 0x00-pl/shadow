@@ -63,6 +63,10 @@ name = "test_sleep"
 path = "sleep/test_sleep.rs"
 
 [[bin]]
+name = "test_ipv6"
+path = "ipv6/test_ipv6.rs"
+
+[[bin]]
 name = "test_socket"
 path = "socket/socket/test_socket.rs"
 
