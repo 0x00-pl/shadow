@@ -59,6 +59,8 @@ pub struct HostParameters {
     pub hostname: CString,
     pub node_id: u32,
     pub ip_addr: libc::in_addr_t,
+    /// The host's IPv6 address in network byte order.
+    pub ip_addr6: [u8; 16],
     pub sim_end_time: EmulatedTime,
     pub requested_bw_down_bits: u64,
     pub requested_bw_up_bits: u64,

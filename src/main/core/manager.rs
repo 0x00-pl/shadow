@@ -309,18 +309,21 @@ impl<'a> Manager<'a> {
             .collect();
 
         for (info, id) in &host_init {
-            // Extract the host address.
-            let std::net::IpAddr::V4(addr) = info.ip_addr.unwrap() else {
-                unreachable!("IPv6 not supported");
-            };
-
             // Register in the global DNS.
             dns_builder
-                .register(*id, addr, info.name.clone())
+                .register(*id, std::net::IpAddr::V4(info.ip_addr), info.name.clone())
                 .with_context(|| {
                     format!(
                         "Failed to register a host with id='{:?}', addr='{}', and name='{}' in the DNS module",
-                        *id, addr, info.name
+                        *id, info.ip_addr, info.name
+                    )
+                })?;
+            dns_builder
+                .register(*id, std::net::IpAddr::V6(info.ip_addr6), info.name.clone())
+                .with_context(|| {
+                    format!(
+                        "Failed to register a host with id='{:?}', addr='{}', and name='{}' in the DNS module",
+                        *id, info.ip_addr6, info.name
                     )
                 })?;
         }
@@ -621,11 +624,8 @@ impl<'a> Manager<'a> {
                 node_seed: host_info.seed,
                 hostname,
                 node_id: host_info.network_node_id,
-                ip_addr: match host_info.ip_addr.unwrap() {
-                    std::net::IpAddr::V4(ip) => u32::to_be(ip.into()),
-                    // the config only allows ipv4 addresses, so this shouldn't happen
-                    std::net::IpAddr::V6(_) => unreachable!("IPv6 not supported"),
-                },
+                ip_addr: u32::to_be(u32::from(host_info.ip_addr)),
+                ip_addr6: host_info.ip_addr6.octets(),
                 sim_end_time: self.end_time,
                 requested_bw_down_bits: host_info.bandwidth_down_bits.unwrap(),
                 requested_bw_up_bits: host_info.bandwidth_up_bits.unwrap(),

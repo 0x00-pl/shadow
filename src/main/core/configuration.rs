@@ -723,9 +723,10 @@ pub struct HostOptions {
 
     pub processes: Vec<ProcessOptions>,
 
-    /// IP address to assign to the host
+    /// IP address to assign to the host. May be an IPv4 or IPv6 address. If
+    /// unset, addresses of both families are assigned automatically.
     #[serde(default)]
-    pub ip_addr: Option<std::net::Ipv4Addr>,
+    pub ip_addr: Option<std::net::IpAddr>,
 
     /// Downstream bandwidth capacity of the host
     #[serde(default)]

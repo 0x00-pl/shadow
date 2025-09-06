@@ -338,7 +338,7 @@ impl Worker {
         let dst_ip = *packetrc.dst_ipv4_address().ip();
         let payload_size = packetrc.payload_len();
 
-        let Some(dst_host_id) = Worker::resolve_ip_to_host_id(dst_ip) else {
+        let Some(dst_host_id) = Worker::resolve_ip_to_host_id(std::net::IpAddr::V4(dst_ip)) else {
             log_once_per_value_at_level!(
                 dst_ip,
                 std::net::Ipv4Addr,
@@ -479,13 +479,13 @@ impl Worker {
 
     pub fn resolve_name_to_ip(name: &std::ffi::CStr) -> Option<std::net::Ipv4Addr> {
         if let Ok(name) = name.to_str() {
-            Worker::with_dns(|dns| dns.name_to_addr(name))
+            Worker::with_dns(|dns| dns.name_to_addr_v4(name))
         } else {
             None
         }
     }
 
-    fn resolve_ip_to_host_id(ip: std::net::Ipv4Addr) -> Option<HostId> {
+    pub fn resolve_ip_to_host_id(ip: std::net::IpAddr) -> Option<HostId> {
         Worker::with_dns(|dns| dns.addr_to_host_id(ip))
     }
 }

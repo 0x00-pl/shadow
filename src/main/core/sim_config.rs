@@ -141,18 +141,17 @@ impl SimConfig {
         )?;
 
         // get all host bandwidths
-        let host_bandwidths = hosts
-            .iter()
-            .map(|host| {
-                // we made sure above that every host has a bandwidth set
-                let bw = Bandwidth {
-                    up_bytes: host.bandwidth_up_bits.unwrap() / 8,
-                    down_bytes: host.bandwidth_down_bits.unwrap() / 8,
-                };
+        let mut host_bandwidths = HashMap::new();
+        for host in hosts.iter() {
+            // we made sure above that every host has a bandwidth set
+            let bw = Bandwidth {
+                up_bytes: host.bandwidth_up_bits.unwrap() / 8,
+                down_bytes: host.bandwidth_down_bits.unwrap() / 8,
+            };
 
-                (host.ip_addr.unwrap(), bw)
-            })
-            .collect();
+            host_bandwidths.insert(std::net::IpAddr::V4(host.ip_addr), bw.clone());
+            host_bandwidths.insert(std::net::IpAddr::V6(host.ip_addr6), bw);
+        }
 
         Ok(Self {
             random,
@@ -175,7 +174,15 @@ pub struct HostInfo {
     pub cpu_precision: Option<SimulationTime>,
     pub bandwidth_down_bits: Option<u64>,
     pub bandwidth_up_bits: Option<u64>,
-    pub ip_addr: Option<std::net::IpAddr>,
+    /// The host's assigned IPv4 address. Valid (non-unspecified) after IP
+    /// assignment within `SimConfig::new()`.
+    pub ip_addr: std::net::Ipv4Addr,
+    /// The host's assigned IPv6 address. Valid (non-unspecified) after IP
+    /// assignment within `SimConfig::new()`.
+    pub ip_addr6: std::net::Ipv6Addr,
+    /// The address pinned in the configuration file, if any. Only used during
+    /// IP assignment within `SimConfig::new()`.
+    pub pinned_ip_addr: Option<std::net::IpAddr>,
     pub log_level: Option<LogLevel>,
     pub pcap_config: Option<PcapConfig>,
     pub send_buf_size: u64,
@@ -253,7 +260,9 @@ fn build_host(
             .bandwidth_up
             .map(|x| x.convert(units::SiPrefixUpper::Base).unwrap().value()),
 
-        ip_addr: host.ip_addr.map(|x| x.into()),
+        pinned_ip_addr: host.ip_addr,
+        ip_addr: std::net::Ipv4Addr::UNSPECIFIED,
+        ip_addr6: std::net::Ipv6Addr::UNSPECIFIED,
         log_level: host.host_options.log_level.flatten(),
         pcap_config: host
             .host_options
@@ -387,8 +396,10 @@ fn assign_ips(hosts: &mut [HostInfo]) -> anyhow::Result<IpAssignment<u32>> {
     let mut ip_assignment = IpAssignment::new();
 
     // first register hosts that have a specific IP address
-    for host in hosts.iter().filter(|x| x.ip_addr.is_some()) {
-        let ip = host.ip_addr.unwrap();
+    for host in hosts.iter() {
+        let Some(ip) = host.pinned_ip_addr else {
+            continue;
+        };
         let hostname = &host.name;
         let node_id = host.network_node_id;
         ip_assignment.assign_ip(node_id, ip).with_context(|| {
@@ -396,11 +407,20 @@ fn assign_ips(hosts: &mut [HostInfo]) -> anyhow::Result<IpAssignment<u32>> {
         })?;
     }
 
-    // then register remaining hosts
-    for host in hosts.iter_mut().filter(|x| x.ip_addr.is_none()) {
-        let ip = ip_assignment.assign(host.network_node_id);
-        // assign the new IP to the host
-        host.ip_addr = Some(ip);
+    // then assign IPv4 addresses to the remaining hosts, re-using the pinned
+    // address where one exists
+    for host in hosts.iter_mut() {
+        if let Some(std::net::IpAddr::V4(ip)) = host.pinned_ip_addr {
+            host.ip_addr = ip;
+        } else {
+            host.ip_addr = ip_assignment.assign_v4(host.network_node_id);
+        }
+
+        if let Some(std::net::IpAddr::V6(ip)) = host.pinned_ip_addr {
+            host.ip_addr6 = ip;
+        } else {
+            host.ip_addr6 = ip_assignment.assign_v6(host.network_node_id);
+        }
     }
 
     Ok(ip_assignment)

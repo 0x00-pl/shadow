@@ -348,25 +348,45 @@ impl std::fmt::Display for IpPreviouslyAssignedError {
 pub struct IpAssignment<T: Copy + Eq + Hash + std::fmt::Display> {
     /// A map of host IP addresses to node ids.
     map: HashMap<std::net::IpAddr, T>,
-    /// The last dynamically assigned address.
-    last_assigned_addr: std::net::IpAddr,
+    /// The last dynamically assigned IPv4 address.
+    last_assigned_addr_v4: std::net::Ipv4Addr,
+    /// The last dynamically assigned IPv6 address.
+    last_assigned_addr_v6: std::net::Ipv6Addr,
 }
 
 impl<T: Copy + Eq + Hash + std::fmt::Display> IpAssignment<T> {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
-            last_assigned_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(11, 0, 0, 0)),
+            last_assigned_addr_v4: std::net::Ipv4Addr::new(11, 0, 0, 0),
+            last_assigned_addr_v6: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
         }
     }
 
-    /// Get an unused address and assign it to a node.
-    pub fn assign(&mut self, node_id: T) -> std::net::IpAddr {
+    /// Get an unused IPv4 address and assign it to a node.
+    pub fn assign_v4(&mut self, node_id: T) -> std::net::Ipv4Addr {
         // loop until we find an unused address
         loop {
-            let ip_addr = Self::increment_address(&self.last_assigned_addr);
-            self.last_assigned_addr = ip_addr;
-            if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(ip_addr) {
+            let ip_addr = Self::increment_v4(&self.last_assigned_addr_v4);
+            self.last_assigned_addr_v4 = ip_addr;
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.map.entry(std::net::IpAddr::V4(ip_addr))
+            {
+                e.insert(node_id);
+                break ip_addr;
+            }
+        }
+    }
+
+    /// Get an unused IPv6 address and assign it to a node.
+    pub fn assign_v6(&mut self, node_id: T) -> std::net::Ipv6Addr {
+        // loop until we find an unused address
+        loop {
+            let ip_addr = Self::increment_v6(&self.last_assigned_addr_v6);
+            self.last_assigned_addr_v6 = ip_addr;
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.map.entry(std::net::IpAddr::V6(ip_addr))
+            {
                 e.insert(node_id);
                 break ip_addr;
             }
@@ -397,22 +417,32 @@ impl<T: Copy + Eq + Hash + std::fmt::Display> IpAssignment<T> {
         self.map.values().copied().collect()
     }
 
-    fn increment_address(addr: &std::net::IpAddr) -> std::net::IpAddr {
-        match addr {
-            std::net::IpAddr::V4(x) => {
-                let addr_bits = u32::from(*x);
-                let mut increment = 1;
-                loop {
-                    // increment the address
-                    let next_addr = std::net::Ipv4Addr::from(addr_bits + increment);
-                    match next_addr.octets()[3] {
-                        // if the address ends in ".0" or ".255" (broadcast), try the next
-                        0 | 255 => increment += 1,
-                        _ => break std::net::IpAddr::V4(next_addr),
-                    }
-                }
+    fn increment_v4(addr: &std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+        let addr_bits = u32::from(*addr);
+        let mut increment = 1;
+        loop {
+            // increment the address
+            let next_addr = std::net::Ipv4Addr::from(addr_bits + increment);
+            match next_addr.octets()[3] {
+                // if the address ends in ".0" or ".255" (broadcast), try the next
+                0 | 255 => increment += 1,
+                _ => break next_addr,
             }
-            std::net::IpAddr::V6(_) => unimplemented!(),
+        }
+    }
+
+    fn increment_v6(addr: &std::net::Ipv6Addr) -> std::net::Ipv6Addr {
+        // increment the host portion of the address, avoiding the unspecified
+        // address (which ends in all zeros)
+        let addr_bits = u128::from(*addr);
+        let mut increment = 1;
+        loop {
+            let next_addr = std::net::Ipv6Addr::from(addr_bits.wrapping_add(increment));
+            if u128::from(next_addr) == 0 {
+                increment += 1;
+            } else {
+                break next_addr;
+            }
         }
     }
 }
@@ -645,12 +675,24 @@ mod tests {
 
     #[test]
     fn test_increment_address_skip_broadcast() {
-        let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(11, 0, 0, 254));
-        let incremented = IpAssignment::<i32>::increment_address(&addr);
+        let addr = std::net::Ipv4Addr::new(11, 0, 0, 254);
+        let incremented = IpAssignment::<i32>::increment_v4(&addr);
         assert!(incremented > addr);
-        assert_ne!(
+        assert_ne!(incremented, std::net::Ipv4Addr::new(11, 0, 0, 255));
+    }
+
+    #[test]
+    fn test_increment_v6() {
+        let addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xfffe);
+        let incremented = IpAssignment::<i32>::increment_v6(&addr);
+        assert!(incremented > addr);
+        assert_eq!(
             incremented,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(11, 0, 0, 255))
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xffff)
         );
+        // skipping over the unspecified address (all zeros)
+        let addr = std::net::Ipv6Addr::from(u128::MAX);
+        let incremented = IpAssignment::<i32>::increment_v6(&addr);
+        assert_ne!(u128::from(incremented), 0);
     }
 }
