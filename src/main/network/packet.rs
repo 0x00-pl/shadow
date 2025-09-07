@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use crate::host::network::interface::FifoPacketPriority;
@@ -123,6 +123,16 @@ impl PacketRc {
         priority: FifoPacketPriority,
     ) -> Self {
         Self::from(Packet::new_ipv4_udp(src, dst, payload, priority))
+    }
+
+    /// See `Packet::new_udp()` for more details.
+    pub fn new_udp(
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Bytes,
+        priority: FifoPacketPriority,
+    ) -> Self {
+        Self::from(Packet::new_udp(src, dst, payload, priority))
     }
 
     /// Creates a thread-safe shared reference to a new `Packet` using the provided information.
@@ -306,7 +316,18 @@ impl Packet {
         payload: Bytes,
         priority: FifoPacketPriority,
     ) -> Self {
-        let header = Header::new(IpAddr::V4(*src.ip()), IpAddr::V4(*dst.ip()));
+        Self::new_udp(SocketAddr::V4(src), SocketAddr::V4(dst), payload, priority)
+    }
+
+    /// Creates a new UDP packet using the provided data. The source and
+    /// destination addresses may be either IPv4 or IPv6.
+    pub fn new_udp(
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Bytes,
+        priority: FifoPacketPriority,
+    ) -> Self {
+        let header = Header::new(src.ip(), dst.ip());
 
         let udp_header = UdpHeader::new(src.port(), dst.port());
         let udp_packet = UdpData::new(udp_header, payload);
@@ -407,6 +428,34 @@ impl Packet {
         }
     }
 
+    /// Returns the packet's source address and source port.
+    pub fn src_address(&self) -> SocketAddr {
+        SocketAddr::new(self.header.src, self.src_port())
+    }
+
+    /// Returns the packet's destination address and destination port.
+    pub fn dst_address(&self) -> SocketAddr {
+        SocketAddr::new(self.header.dst, self.dst_port())
+    }
+
+    /// Returns the packet's source port.
+    pub fn src_port(&self) -> u16 {
+        match &self.data {
+            Data::LegacyTcp(tcp_rc) => tcp_rc.borrow().header.src_port,
+            Data::Tcp(tcp) => tcp.header.src_port,
+            Data::Udp(udp) => udp.header.src_port,
+        }
+    }
+
+    /// Returns the packet's destination port.
+    pub fn dst_port(&self) -> u16 {
+        match &self.data {
+            Data::LegacyTcp(tcp_rc) => tcp_rc.borrow().header.dst_port,
+            Data::Tcp(tcp) => tcp.header.dst_port,
+            Data::Udp(udp) => udp.header.dst_port,
+        }
+    }
+
     /// Returns the packet's IPv4 source address and source port.
     ///
     /// Panics
@@ -417,13 +466,7 @@ impl Packet {
             unimplemented!()
         };
 
-        let port = match &self.data {
-            Data::LegacyTcp(tcp_rc) => tcp_rc.borrow().header.src_port,
-            Data::Tcp(tcp) => tcp.header.src_port,
-            Data::Udp(udp) => udp.header.src_port,
-        };
-
-        SocketAddrV4::new(addr, port)
+        SocketAddrV4::new(addr, self.src_port())
     }
 
     /// Returns the packet's IPv4 destination address and destination port.
@@ -436,13 +479,7 @@ impl Packet {
             unimplemented!()
         };
 
-        let port = match &self.data {
-            Data::LegacyTcp(tcp_rc) => tcp_rc.borrow().header.dst_port,
-            Data::Tcp(tcp) => tcp.header.dst_port,
-            Data::Udp(udp) => udp.header.dst_port,
-        };
-
-        SocketAddrV4::new(addr, port)
+        SocketAddrV4::new(addr, self.dst_port())
     }
 
     /// Returns the priority set at packet creation time.
@@ -465,6 +502,11 @@ struct Header {
 }
 
 impl Header {
+    /// The IPv4 header length (20 bytes without options).
+    const LEN_V4: usize = 20;
+    /// The IPv6 header length (40 bytes, no extension headers).
+    const LEN_V6: usize = 40;
+
     pub fn new(src: IpAddr, dst: IpAddr) -> Self {
         // TODO: make TOS configurable, then the network queue can do pfifo properly.
         Self {
@@ -477,9 +519,9 @@ impl Header {
     pub fn len(&self) -> usize {
         match &self.dst {
             // 20 bytes without options: https://en.wikipedia.org/wiki/IPv4
-            IpAddr::V4(_) => 20usize,
+            IpAddr::V4(_) => Self::LEN_V4,
             // 40 bytes: https://en.wikipedia.org/wiki/IPv6
-            IpAddr::V6(_) => 40usize,
+            IpAddr::V6(_) => Self::LEN_V6,
         }
     }
 }
@@ -798,6 +840,15 @@ impl Metadata {
 
 impl PacketDisplay for Packet {
     fn display_bytes(&self, mut writer: impl Write) -> std::io::Result<()> {
+        match self.header.src {
+            IpAddr::V4(_) => self.display_bytes_v4(writer),
+            IpAddr::V6(_) => self.display_bytes_v6(writer),
+        }
+    }
+}
+
+impl Packet {
+    fn display_bytes_v4(&self, mut writer: impl Write) -> std::io::Result<()> {
         // write the IP header
 
         let version_and_header_length: u8 = 0x45;
@@ -829,6 +880,46 @@ impl PacketDisplay for Packet {
         writer.write_all(&source_ip)?;
         // destination IP: 4 bytes
         writer.write_all(&dest_ip)?;
+
+        // write protocol-specific data
+
+        match &self.data {
+            Data::LegacyTcp(tcp_ref) => write_tcpdata_bytes(&tcp_ref.borrow(), writer),
+            Data::Tcp(tcp) => write_tcpdata_bytes(tcp, writer),
+            Data::Udp(udp) => write_udpdata_bytes(udp, writer),
+        }?;
+
+        Ok(())
+    }
+
+    // The IPv6 header fields are fabricated similarly to the IPv4 header
+    // fields in `display_bytes_v4()`.
+    fn display_bytes_v6(&self, mut writer: impl Write) -> std::io::Result<()> {
+        let IpAddr::V6(source_ip) = self.header.src else {
+            unreachable!()
+        };
+        let IpAddr::V6(dest_ip) = self.header.dst else {
+            unreachable!()
+        };
+
+        let version_traffic_class_flow_label: [u8; 4] = [0x60, 0x00, 0x00, 0x00];
+        let payload_length: u16 =
+            (self.len() - Header::LEN_V6).try_into().unwrap();
+        let next_header: u8 = self.data.iana_protocol().number();
+        let hop_limit: u8 = 64;
+
+        // version, traffic class, flow label: 4 bytes
+        writer.write_all(&version_traffic_class_flow_label)?;
+        // payload length: 2 bytes
+        writer.write_all(&payload_length.to_be_bytes())?;
+        // next header: 1 byte
+        writer.write_all(&[next_header])?;
+        // hop limit: 1 byte
+        writer.write_all(&[hop_limit])?;
+        // source IP: 16 bytes
+        writer.write_all(&source_ip.octets())?;
+        // destination IP: 16 bytes
+        writer.write_all(&dest_ip.octets())?;
 
         // write protocol-specific data
 
