@@ -1,4 +1,5 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+
+use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Weak};
 
 use atomic_refcell::AtomicRefCell;
@@ -502,15 +503,15 @@ impl InetSocketWeak {
 /// associated with the local address `local_addr` and peer address 0.0.0.0:0.
 fn associate_socket(
     socket: InetSocket,
-    local_addr: SocketAddrV4,
-    peer_addr: SocketAddrV4,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
     check_generic_peer: bool,
     net_ns: &NetworkNamespace,
     rng: impl rand::Rng,
-) -> Result<(SocketAddrV4, AssociationHandle), Errno> {
+) -> Result<(SocketAddr, AssociationHandle), Errno> {
     log::trace!("Trying to associate socket with addresses (local={local_addr}, peer={peer_addr})");
 
-    if !local_addr.ip().is_unspecified() && net_ns.interface_borrow(*local_addr.ip()).is_none() {
+    if !local_addr.ip().is_unspecified() && net_ns.interface_borrow(local_addr.ip()).is_none() {
         log::debug!(
             "No network interface exists for the provided local address {}",
             local_addr.ip(),
@@ -528,8 +529,7 @@ fn associate_socket(
     let local_addr = if local_addr.port() != 0 {
         local_addr
     } else {
-        let Some(new_port) =
-            net_ns.get_random_free_port(protocol, *local_addr.ip(), peer_addr, rng)
+        let Some(new_port) = net_ns.get_random_free_port(protocol, local_addr.ip(), peer_addr, rng)
         else {
             log::debug!("Association required an ephemeral port but none are available");
             return Err(Errno::EADDRINUSE);
@@ -538,8 +538,12 @@ fn associate_socket(
         log::debug!("Associating with generated ephemeral port {new_port}");
 
         // update the address with the same ip, but new port
-        SocketAddrV4::new(*local_addr.ip(), new_port)
+        SocketAddr::new(local_addr.ip(), new_port)
     };
+
+    // the unspecified peer address with the same address family as the local
+    // address
+    let generic_peer = SocketAddr::new(unspecified_like(local_addr.ip()), 0);
 
     // make sure the port is available at this address for this protocol
     match net_ns.is_addr_in_use(protocol, local_addr, peer_addr) {
@@ -554,15 +558,10 @@ fn associate_socket(
     }
 
     if check_generic_peer {
-        match net_ns.is_addr_in_use(
-            protocol,
-            local_addr,
-            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-        ) {
+        match net_ns.is_addr_in_use(protocol, local_addr, generic_peer) {
             Ok(true) => {
                 log::debug!(
-                    "The generic addresses (local={local_addr}, peer={}) are not available",
-                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+                    "The generic addresses (local={local_addr}, peer={generic_peer}) are not available"
                 );
                 return Err(Errno::EADDRINUSE);
             }
@@ -575,6 +574,62 @@ fn associate_socket(
     let handle = unsafe { net_ns.associate_interface(&socket, protocol, local_addr, peer_addr) };
 
     Ok((local_addr, handle))
+}
+
+/// Returns the address family corresponding to `addr`.
+pub(crate) fn addr_family(addr: std::net::IpAddr) -> linux_api::socket::AddressFamily {
+    match addr {
+        std::net::IpAddr::V4(_) => linux_api::socket::AddressFamily::AF_INET,
+        std::net::IpAddr::V6(_) => linux_api::socket::AddressFamily::AF_INET6,
+    }
+}
+
+/// Returns the wildcard (unspecified) address for the given address family.
+pub(crate) fn wildcard_for(family: linux_api::socket::AddressFamily) -> std::net::IpAddr {
+    match family {
+        linux_api::socket::AddressFamily::AF_INET => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        }
+        linux_api::socket::AddressFamily::AF_INET6 => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        }
+        _ => unimplemented!("unsupported address family {family:?}"),
+    }
+}
+
+/// Returns the loopback address for the given address family.
+pub(crate) fn loopback_for(family: linux_api::socket::AddressFamily) -> std::net::IpAddr {
+    match family {
+        linux_api::socket::AddressFamily::AF_INET => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        linux_api::socket::AddressFamily::AF_INET6 => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        _ => unimplemented!("unsupported address family {family:?}"),
+    }
+}
+
+/// Returns the interface default (outgoing) address for the given address
+/// family.
+pub(crate) fn default_ip_for(
+    family: linux_api::socket::AddressFamily,
+    net_ns: &NetworkNamespace,
+) -> std::net::IpAddr {
+    match family {
+        linux_api::socket::AddressFamily::AF_INET => std::net::IpAddr::V4(net_ns.default_ip),
+        linux_api::socket::AddressFamily::AF_INET6 => std::net::IpAddr::V6(net_ns.default_ip6),
+        _ => unimplemented!("unsupported address family {family:?}"),
+    }
+}
+
+/// Returns the unspecified (wildcard) address with the same address family as
+/// `addr`.
+fn unspecified_like(addr: std::net::IpAddr) -> std::net::IpAddr {
+    match addr {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
 }
 
 mod export {

@@ -1,5 +1,5 @@
 use std::ffi::CStr;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -280,12 +280,18 @@ impl LegacyTcpSocket {
         // associate the socket
         let (addr, handle) = inet::associate_socket(
             InetSocket::LegacyTcp(Arc::clone(socket)),
-            addr,
-            peer_addr,
+            SocketAddr::V4(addr),
+            SocketAddr::V4(peer_addr),
             /* check_generic_peer= */ true,
             net_ns,
             rng,
         )?;
+
+        // the legacy TCP stack only supports IPv4
+        let addr = match addr {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("legacy TCP does not support IPv6"),
+        };
 
         // the handle normally disassociates the socket when dropped, but the C TCP code does it's
         // own manual disassociation, so we'll just let it do its own thing
@@ -670,10 +676,10 @@ impl LegacyTcpSocket {
             log::trace!("Implicitly binding listener socket");
 
             // implicit bind: bind to all interfaces at an ephemeral port
-            let local_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
             // this will allow us to receive packets from any peer address
-            let peer_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            let peer_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
             // associate the socket
             let (local_addr, handle) = super::associate_socket(
@@ -684,6 +690,12 @@ impl LegacyTcpSocket {
                 net_ns,
                 rng,
             )?;
+
+            // the legacy TCP stack only supports IPv4
+            let local_addr = match local_addr {
+                SocketAddr::V4(addr) => addr,
+                SocketAddr::V6(_) => unreachable!("legacy TCP does not support IPv6"),
+            };
 
             // the handle normally disassociates the socket when dropped, but the C TCP code does
             // it's own manual disassociation, so we'll just let it do its own thing
@@ -788,12 +800,18 @@ impl LegacyTcpSocket {
             // associate the socket
             let (local_addr, handle) = super::associate_socket(
                 super::InetSocket::LegacyTcp(socket.clone()),
-                local_addr,
-                peer_addr,
+                SocketAddr::V4(local_addr),
+                SocketAddr::V4(peer_addr),
                 /* check_generic_peer= */ true,
                 net_ns,
                 rng,
             )?;
+
+            // the legacy TCP stack only supports IPv4
+            let local_addr = match local_addr {
+                SocketAddr::V4(addr) => addr,
+                SocketAddr::V6(_) => unreachable!("legacy TCP does not support IPv6"),
+            };
 
             // the handle normally disassociates the socket when dropped, but the C TCP code does
             // it's own manual disassociation, so we'll just let it do its own thing
@@ -1021,8 +1039,8 @@ impl LegacyTcpSocket {
 
             let (_addr, handle) = inet::associate_socket(
                 InetSocket::LegacyTcp(Arc::clone(new_socket)),
-                SocketAddrV4::from(child_local_addr),
-                SocketAddrV4::from(child_peer_addr),
+                SocketAddr::V4(SocketAddrV4::from(child_local_addr)),
+                SocketAddr::V4(SocketAddrV4::from(child_peer_addr)),
                 /* Allow the parent/listening socket to be bound to the same address,
                  * with a missing/generic peer. */
                 /* check_generic_peer= */

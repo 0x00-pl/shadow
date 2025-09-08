@@ -118,7 +118,7 @@ mod export {
                     worker::Worker::with_active_host(|host| {
                         assert_eq!(host.id(), host_id);
                         let socket = unsafe { Box::from_raw(socket) };
-                        host.notify_socket_has_packets(ip, &socket);
+                        host.notify_socket_has_packets(std::net::IpAddr::V4(ip), &socket);
                     })
                     .unwrap();
                 });

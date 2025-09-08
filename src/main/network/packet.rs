@@ -102,13 +102,13 @@ impl PacketRc {
     /// Additional references to the `Packet` can be cheaply obtained by cloning the returned
     /// `PacketRc`. The `Packet` is dropped when its last `PacketRc` reference is dropped.
     ///
-    /// See `Packet::new_ipv4_tcp()` for more details.
-    pub fn new_ipv4_tcp(
+    /// See `Packet::new_tcp()` for more details.
+    pub fn new_tcp(
         header: tcp::TcpHeader,
         payload: tcp::Payload,
         priority: FifoPacketPriority,
     ) -> Self {
-        Self::from(Packet::new_ipv4_tcp(header, payload, priority))
+        Self::from(Packet::new_tcp(header, payload, priority))
     }
 
     /// Creates a thread-safe shared reference to a new `Packet` using the provided information.
@@ -292,16 +292,16 @@ impl Packet {
         }
     }
 
-    /// Creates a new IPv4 TCP packet using the provided data.
-    pub fn new_ipv4_tcp(
-        header: tcp::TcpHeader,
+    /// Creates a new TCP packet using the provided data. The TCP header's IP
+    /// addresses may be either IPv4 or IPv6.
+    pub fn new_tcp(
+        tcp_header: tcp::TcpHeader,
         payload: tcp::Payload,
         priority: FifoPacketPriority,
     ) -> Self {
-        let hdr = header;
-        let header = Header::new(IpAddr::V4(hdr.ip.src), IpAddr::V4(hdr.ip.dst));
+        let header = Header::new(tcp_header.ip.src, tcp_header.ip.dst);
 
-        let tcp_packet = TcpData::new(TcpHeader::from(hdr), payload.0);
+        let tcp_packet = TcpData::new(TcpHeader::from(tcp_header), payload.0);
         let data = Data::from(tcp_packet);
 
         let meta = Metadata::new(priority);
@@ -347,21 +347,17 @@ impl Packet {
         Self::new_ipv4_udp(unspec, unspec, Bytes::copy_from_slice(&[0; 1000]), 0)
     }
 
-    /// If the packet is an IPv4 TCP packet, returns a copy of the TCP header in a format defined by
+    /// If the packet is a TCP packet, returns a copy of the TCP header in a format defined by
     /// the Rust TCP stack. Otherwise, returns `None`.
     ///
     /// Panics
     ///
     /// This function panics if the packet was created with `packet_new_tcp()` in the legacy C API.
-    pub fn ipv4_tcp_header(&self) -> Option<tcp::TcpHeader> {
+    pub fn tcp_header(&self) -> Option<tcp::TcpHeader> {
         let hdr = &self.header;
 
-        let IpAddr::V4(src) = hdr.src else {
-            return None;
-        };
-        let IpAddr::V4(dst) = hdr.dst else {
-            return None;
-        };
+        let src = hdr.src;
+        let dst = hdr.dst;
 
         let tcp_hdr = match &self.data {
             // The legacy TCP header is obtained with `packet_getTCPHeader()` in the legacy C API.
@@ -371,7 +367,7 @@ impl Packet {
         };
 
         Some(tcp::TcpHeader {
-            ip: tcp::Ipv4Header { src, dst },
+            ip: tcp::IpHeader { src, dst },
             flags: tcp_hdr.flags,
             src_port: tcp_hdr.src_port,
             dst_port: tcp_hdr.dst_port,
@@ -839,7 +835,7 @@ impl Metadata {
 }
 
 impl PacketDisplay for Packet {
-    fn display_bytes(&self, mut writer: impl Write) -> std::io::Result<()> {
+    fn display_bytes(&self, writer: impl Write) -> std::io::Result<()> {
         match self.header.src {
             IpAddr::V4(_) => self.display_bytes_v4(writer),
             IpAddr::V6(_) => self.display_bytes_v6(writer),
@@ -1081,9 +1077,9 @@ mod tests {
             tcp::util::SmallArrayBackedSlice::<4, (u32, u32)>::new(&[(1, 3), (5, 6)]).unwrap();
 
         tcp::TcpHeader {
-            ip: tcp::Ipv4Header {
-                src: *src.ip(),
-                dst: *dst.ip(),
+            ip: tcp::IpHeader {
+                src: SocketAddr::V4(src).ip(),
+                dst: SocketAddr::V4(dst).ip(),
             },
             flags: tcp::TcpFlags::SYN,
             src_port: src.port(),
@@ -1109,7 +1105,7 @@ mod tests {
             Bytes::from_static(b" World!"),
         ]);
 
-        let packetrc = PacketRc::new_ipv4_tcp(tcp_hdr, payload.clone(), priority);
+        let packetrc = PacketRc::new_tcp(tcp_hdr, payload.clone(), priority);
 
         assert_eq!(src, packetrc.src_ipv4_address());
         assert_eq!(dst, packetrc.dst_ipv4_address());
@@ -1117,7 +1113,7 @@ mod tests {
         assert_eq!(IanaProtocol::Tcp, packetrc.iana_protocol());
         assert_eq!(
             TcpHeader::from(tcp_hdr),
-            TcpHeader::from(packetrc.ipv4_tcp_header().unwrap())
+            TcpHeader::from(packetrc.tcp_header().unwrap())
         );
 
         assert_eq!(payload.len() as usize, packetrc.payload_len());
@@ -1139,7 +1135,7 @@ mod tests {
         // Empty chunks vec.
 
         let payload = tcp::Payload(vec![]);
-        let packetrc = PacketRc::new_ipv4_tcp(tcp_hdr, payload, priority);
+        let packetrc = PacketRc::new_tcp(tcp_hdr, payload, priority);
 
         assert_eq!(0, packetrc.payload_len());
         let chunks = packetrc.payload();
@@ -1148,7 +1144,7 @@ mod tests {
         // Non-empty chunks vec with empty bytes objects.
 
         let payload = tcp::Payload(vec![Bytes::new(), Bytes::new()]);
-        let packetrc = PacketRc::new_ipv4_tcp(tcp_hdr, payload, priority);
+        let packetrc = PacketRc::new_tcp(tcp_hdr, payload, priority);
 
         assert_eq!(0, packetrc.payload_len());
         let chunks = packetrc.payload();

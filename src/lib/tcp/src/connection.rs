@@ -1,13 +1,13 @@
 use bytes::{Buf, Bytes};
 use std::io::{Read, Write};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 use crate::buffer::{RecvQueue, Segment};
 use crate::seq::{Seq, SeqRange};
 use crate::util::time::Instant;
 use crate::window_scaling::WindowScaling;
 use crate::{
-    Ipv4Header, Payload, PopPacketError, PushPacketError, RecvError, SendError, TcpConfig,
+    IpHeader, Payload, PopPacketError, PushPacketError, RecvError, SendError, TcpConfig,
     TcpFlags, TcpHeader,
 };
 
@@ -15,8 +15,8 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Connection<I: Instant> {
     pub(crate) config: TcpConfig,
-    pub(crate) local_addr: SocketAddrV4,
-    pub(crate) remote_addr: SocketAddrV4,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) remote_addr: SocketAddr,
     pub(crate) send: ConnectionSend<I>,
     pub(crate) recv: Option<ConnectionRecv>,
     pub(crate) need_to_ack: bool,
@@ -34,8 +34,8 @@ impl<I: Instant> Connection<I> {
     const RECV_BUF_MAX: u32 = 100_000;
 
     pub fn new(
-        local_addr: SocketAddrV4,
-        remote_addr: SocketAddrV4,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
         send_initial_seq: Seq,
         config: TcpConfig,
     ) -> Self {
@@ -387,9 +387,9 @@ impl<I: Instant> Connection<I> {
         }
 
         let header = TcpHeader {
-            ip: Ipv4Header {
-                src: *self.local_addr.ip(),
-                dst: *self.remote_addr.ip(),
+            ip: IpHeader {
+                src: self.local_addr.ip(),
+                dst: self.remote_addr.ip(),
             },
             flags,
             src_port: self.local_addr.port(),
@@ -824,7 +824,7 @@ fn trim_chunk(seq: Seq, mut chunk: Bytes, range: &SeqRange) -> Option<(Seq, Byte
 mod tests {
     use super::*;
 
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     // helper to make the tests fit on a single line
     fn range(start: u32, end: u32) -> SeqRange {
@@ -863,9 +863,9 @@ mod tests {
             range: SeqRange,
         ) -> Option<(TcpFlags, Seq, Bytes)> {
             let header = TcpHeader {
-                ip: Ipv4Header {
-                    src: Ipv4Addr::UNSPECIFIED,
-                    dst: Ipv4Addr::UNSPECIFIED,
+                ip: IpHeader {
+                    src: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    dst: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 },
                 flags,
                 src_port: 0,

@@ -139,6 +139,25 @@ impl SockaddrStorage {
         })
     }
 
+    /// If the socket address represents a valid IPv4 or IPv6 socket address,
+    /// returns it as a [`std::net::SocketAddr`].
+    pub fn as_std_inet(&self) -> Option<std::net::SocketAddr> {
+        if let Some(addr) = self.as_inet() {
+            return Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                addr.ip(),
+                addr.port(),
+            )));
+        }
+        self.as_inet6().map(|addr| {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                addr.ip(),
+                addr.port(),
+                addr.flowinfo(),
+                addr.scope_id(),
+            ))
+        })
+    }
+
     /// Get a new `SockaddrStorage` with a copy of the ipv6 socket address.
     pub fn from_inet6(addr: &nix::sys::socket::SockaddrIn6) -> Self {
         // SAFETY: Assume that `nix::sys::socket::SockaddrIn6` is a transparent wrapper around a
@@ -292,6 +311,15 @@ impl From<std::net::SocketAddrV4> for SockaddrStorage {
 impl From<std::net::SocketAddrV6> for SockaddrStorage {
     fn from(addr: std::net::SocketAddrV6) -> Self {
         nix::sys::socket::SockaddrIn6::from(addr).into()
+    }
+}
+
+impl From<std::net::SocketAddr> for SockaddrStorage {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        match addr {
+            std::net::SocketAddr::V4(addr) => addr.into(),
+            std::net::SocketAddr::V6(addr) => addr.into(),
+        }
     }
 }
 

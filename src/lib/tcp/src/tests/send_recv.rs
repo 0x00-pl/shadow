@@ -6,7 +6,7 @@ use std::rc::Rc;
 use bytes::Bytes;
 
 use crate::tests::{Host, Scheduler, TcpSocket, TestEnvState, establish_helper};
-use crate::{Ipv4Header, Payload, Shutdown, TcpFlags, TcpHeader, TcpState};
+use crate::{IpHeader, Payload, Shutdown, TcpFlags, TcpHeader, TcpState};
 
 #[test]
 fn test_send_recv() {
@@ -30,7 +30,7 @@ fn test_send_recv() {
 
     // send a packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -103,7 +103,7 @@ fn test_ack_with_empty_usable_send_window() {
 
     // send a packet with a payload to trigger an acknowledgement
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -194,7 +194,7 @@ fn test_coalesce_recv() {
 
     // send two packets to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -216,7 +216,7 @@ fn test_coalesce_recv() {
     assert_eq!(pushed_len, message.len());
 
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -258,7 +258,7 @@ fn test_close_with_non_empty_recv_buffer() {
 
     // send a payload packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -309,7 +309,7 @@ fn test_recv_after_shutdown_both() {
 
     // send a payload packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -347,7 +347,7 @@ fn test_recv_after_shutdown_both() {
 
     // send a FIN packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -410,7 +410,7 @@ fn test_incoming_payload_after_close() {
 
     // send a payload packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -468,7 +468,7 @@ fn test_incoming_payload_after_shutdown_read() {
 
     // send a payload packet to the socket
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },

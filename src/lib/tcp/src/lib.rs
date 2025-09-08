@@ -84,7 +84,7 @@
 
 use std::fmt::Debug;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 
 use bytes::{Bytes, BytesMut};
 
@@ -189,8 +189,8 @@ where
 
     fn connect<T, E>(
         self,
-        _addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::InvalidState))
     }
@@ -237,7 +237,7 @@ where
 
     fn wants_to_send(&self) -> bool;
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)>;
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)>;
 }
 
 #[derive(Debug)]
@@ -284,8 +284,8 @@ impl<X: Dependencies> TcpState<X> {
     #[inline]
     pub fn connect<T, E>(
         &mut self,
-        addr: SocketAddrV4,
-        associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        addr: SocketAddr,
+        associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> Result<T, ConnectError<E>> {
         self.with_state(|state| state.connect(addr, associate_fn))
     }
@@ -335,7 +335,7 @@ impl<X: Dependencies> TcpState<X> {
     }
 
     #[inline]
-    pub fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    pub fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         self.0.as_ref().unwrap().local_remote_addrs()
     }
 }
@@ -467,14 +467,14 @@ impl<X: Dependencies> AcceptedTcpState<X> {
         TcpState(Some(self.0.into()))
     }
 
-    pub fn local_addr(&self) -> SocketAddrV4 {
+    pub fn local_addr(&self) -> SocketAddr {
         match &self.0 {
             AcceptedTcpStateInner::Established(state) => state.connection.local_addr,
             AcceptedTcpStateInner::CloseWait(state) => state.connection.local_addr,
         }
     }
 
-    pub fn remote_addr(&self) -> SocketAddrV4 {
+    pub fn remote_addr(&self) -> SocketAddr {
         match &self.0 {
             AcceptedTcpStateInner::Established(state) => state.connection.remote_addr,
             AcceptedTcpStateInner::CloseWait(state) => state.connection.remote_addr,
@@ -677,7 +677,7 @@ bitflags::bitflags! {
 
 #[derive(Copy, Clone, Debug)]
 pub struct TcpHeader {
-    pub ip: Ipv4Header,
+    pub ip: IpHeader,
     pub flags: TcpFlags,
     pub src_port: u16,
     pub dst_port: u16,
@@ -691,19 +691,19 @@ pub struct TcpHeader {
 }
 
 impl TcpHeader {
-    pub fn src(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.ip.src, self.src_port)
+    pub fn src(&self) -> SocketAddr {
+        SocketAddr::new(self.ip.src, self.src_port)
     }
 
-    pub fn dst(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.ip.dst, self.dst_port)
+    pub fn dst(&self) -> SocketAddr {
+        SocketAddr::new(self.ip.dst, self.dst_port)
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct Ipv4Header {
-    pub src: Ipv4Addr,
-    pub dst: Ipv4Addr,
+pub struct IpHeader {
+    pub src: IpAddr,
+    pub dst: IpAddr,
 }
 
 /// A packet payload containing a list of [byte](Bytes) chunks.

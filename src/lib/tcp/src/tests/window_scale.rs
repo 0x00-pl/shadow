@@ -4,7 +4,7 @@ use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 
 use crate::tests::{Host, Scheduler, TcpSocket, TestEnvState};
-use crate::{Ipv4Header, Payload, TcpConfig, TcpFlags, TcpHeader, TcpState};
+use crate::{IpHeader, Payload, TcpConfig, TcpFlags, TcpHeader, TcpState};
 
 #[test]
 fn test_peer_no_window_scaling() {
@@ -38,9 +38,9 @@ fn test_peer_no_window_scaling() {
 
     // send the SYN+ACK without a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -101,9 +101,9 @@ fn test_local_no_window_scaling() {
 
     // send the SYN+ACK without a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -164,9 +164,9 @@ fn test_both_without_window_scaling() {
 
     // send the SYN+ACK without a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -227,9 +227,9 @@ fn test_both_with_window_scaling() {
 
     // send the SYN+ACK without a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -293,9 +293,9 @@ fn test_large_window_scale() {
 
     // send the SYN+ACK with a window scale option that's too large
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -349,7 +349,7 @@ fn test_window_scale_after_receiving_syn_without() {
 
     // send the SYN without a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -374,7 +374,7 @@ fn test_window_scale_after_receiving_syn_without() {
 
     // send the ACK to move the child to the "established" state
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -432,7 +432,7 @@ fn test_window_scale_after_receiving_syn_with() {
 
     // send the SYN with a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -457,7 +457,7 @@ fn test_window_scale_after_receiving_syn_with() {
 
     // send the ACK to move the child to the "established" state
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -524,9 +524,9 @@ fn test_duplicate_syn_with_different_window_scale() {
 
     // send the SYN+ACK with a window scale option
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -544,9 +544,9 @@ fn test_duplicate_syn_with_different_window_scale() {
 
     // send the SYN+ACK again with a different window scale
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,

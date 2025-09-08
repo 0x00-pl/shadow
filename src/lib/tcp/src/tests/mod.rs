@@ -15,14 +15,14 @@ use std::cell::{Cell, Ref, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::{Rc, Weak};
 
 use crate::tests::util::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use crate::{
-    AcceptError, CloseError, ConnectError, Dependencies, Ipv4Header, ListenError, Payload,
+    AcceptError, CloseError, ConnectError, Dependencies, IpHeader, ListenError, Payload,
     PollState, PopPacketError, PushPacketError, RecvError, RstCloseError, SendError, Shutdown,
     TcpConfig, TcpFlags, TcpHeader, TcpState, TimerRegisteredBy,
 };
@@ -480,7 +480,7 @@ impl TcpSocket {
 
     pub fn bind(
         tcp: &Rc<RefCell<Self>>,
-        local_addr: SocketAddrV4,
+        local_addr: SocketAddr,
         host: &mut Host,
     ) -> Result<(), Errno> {
         let tcp_ref = &mut *tcp.borrow_mut();
@@ -492,12 +492,12 @@ impl TcpSocket {
 
         if !local_addr.ip().is_loopback()
             && !local_addr.ip().is_unspecified()
-            && local_addr.ip() != &host.ip_addr
+            && local_addr.ip() != IpAddr::from(host.ip_addr)
         {
             return Err(Errno::EINVAL);
         }
 
-        let peer_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let tcp = Rc::clone(tcp);
         let handle = host.associate_socket(tcp, local_addr, peer_addr)?;
         tcp_ref.association_handle = Some(handle);
@@ -519,8 +519,8 @@ impl TcpSocket {
         } else {
             // if not associated, associate and return the handle
             let associate_fn = || {
-                let local_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-                let peer_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
                 let tcp = Rc::clone(tcp);
                 host.associate_socket(tcp, local_addr, peer_addr).map(Some)
             };
@@ -592,7 +592,7 @@ impl TcpSocket {
 
     pub fn connect(
         socket: &Rc<RefCell<Self>>,
-        peer_addr: SocketAddrV4,
+        peer_addr: SocketAddr,
         host: &mut Host,
     ) -> Result<(), Errno> {
         let socket_ref = &mut *socket.borrow_mut();
@@ -605,7 +605,7 @@ impl TcpSocket {
         let rv = if let Some(mut local_addr) = local_addr {
             if local_addr.ip().is_unspecified() {
                 let route = host
-                    .get_outgoing_route(*local_addr.ip(), *peer_addr.ip())
+                    .get_outgoing_route(local_addr.ip(), peer_addr.ip())
                     .unwrap();
                 local_addr.set_ip(route);
             }
@@ -617,9 +617,9 @@ impl TcpSocket {
             // if not associated, associate and return the handle
             let associate_fn = || {
                 let route = host
-                    .get_outgoing_route(Ipv4Addr::UNSPECIFIED, *peer_addr.ip())
+                    .get_outgoing_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED), peer_addr.ip())
                     .unwrap();
-                let local_addr = SocketAddrV4::new(route, 0);
+                let local_addr = SocketAddr::new(route, 0);
 
                 let socket = Rc::clone(socket);
                 let handle = host.associate_socket(socket, local_addr, peer_addr);
@@ -687,21 +687,21 @@ impl TcpSocket {
 
 #[derive(Debug)]
 struct Host {
-    ip_addr: Ipv4Addr,
+    ip_addr: IpAddr,
 }
 
 impl Host {
     pub fn new() -> Self {
         Host {
-            ip_addr: "1.2.3.4".parse().unwrap(),
+            ip_addr: IpAddr::V4("1.2.3.4".parse().unwrap()),
         }
     }
 
     pub fn associate_socket(
         &mut self,
         _socket: Rc<RefCell<TcpSocket>>,
-        mut local_addr: SocketAddrV4,
-        remote_addr: SocketAddrV4,
+        mut local_addr: SocketAddr,
+        remote_addr: SocketAddr,
     ) -> Result<AssociationHandle, Errno> {
         if local_addr.port() == 0 {
             // TODO
@@ -713,12 +713,12 @@ impl Host {
         })
     }
 
-    pub fn get_outgoing_route(&self, src: Ipv4Addr, dst: Ipv4Addr) -> Option<Ipv4Addr> {
+    pub fn get_outgoing_route(&self, src: IpAddr, dst: IpAddr) -> Option<IpAddr> {
         assert!(!dst.is_unspecified());
 
         if src.is_unspecified() {
             if dst.is_loopback() {
-                return Some(Ipv4Addr::LOCALHOST);
+                return Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
             } else {
                 return Some(self.ip_addr);
             }
@@ -738,16 +738,16 @@ impl Host {
 
 #[derive(Debug)]
 struct AssociationHandle {
-    local_addr: SocketAddrV4,
-    remote_addr: SocketAddrV4,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
 }
 
 impl AssociationHandle {
-    pub fn local_addr(&self) -> SocketAddrV4 {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    pub fn remote_addr(&self) -> SocketAddrV4 {
+    pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 }
@@ -769,7 +769,7 @@ fn test_timer() {
 
     // send the SYN
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -847,7 +847,7 @@ fn establish_helper(scheduler: &Scheduler, host: &mut Host) -> Rc<RefCell<TcpSoc
     let tcp = TcpSocket::new(scheduler, TcpConfig::default());
     assert!(s(&tcp).as_init().is_some());
 
-    TcpSocket::bind(&tcp, SocketAddrV4::new(host.ip_addr, 10), host).unwrap();
+    TcpSocket::bind(&tcp, SocketAddr::new(host.ip_addr, 10), host).unwrap();
 
     TcpSocket::connect(&tcp, "5.6.7.8:20".parse().unwrap(), host).unwrap();
     assert!(s(&tcp).as_syn_sent().is_some());
@@ -858,7 +858,7 @@ fn establish_helper(scheduler: &Scheduler, host: &mut Host) -> Rc<RefCell<TcpSoc
 
     // send the SYN+ACK
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },

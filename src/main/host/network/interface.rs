@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::BufWriter;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::core::configuration::QDiscMode;
@@ -28,12 +28,12 @@ pub struct PcapOptions {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AssociatedSocketKey {
     protocol: IanaProtocol,
-    local: SocketAddrV4,
-    remote: SocketAddrV4,
+    local: SocketAddr,
+    remote: SocketAddr,
 }
 
 impl AssociatedSocketKey {
-    fn new(protocol: IanaProtocol, local: SocketAddrV4, remote: SocketAddrV4) -> Self {
+    fn new(protocol: IanaProtocol, local: SocketAddr, remote: SocketAddr) -> Self {
         Self {
             protocol,
             local,
@@ -55,7 +55,9 @@ fn setup_pcap_writer(
 // in a `RefCell`. We should remove the `RefCell`s to simplify the code and fix any circular
 // code paths that exist.
 pub struct NetworkInterface {
-    addr: Ipv4Addr,
+    /// The interface's addresses. Interfaces support both an IPv4 and an IPv6
+    /// address.
+    addrs: Vec<IpAddr>,
     /// The sockets from which we will pull out packets so that we can send them over the network.
     send_sockets: RefCell<NetworkQueue<InetSocket>>,
     /// The sockets to which we will push incoming packets so they can be received by the network
@@ -76,7 +78,7 @@ impl NetworkInterface {
     /// filesystem-appropriate static string.
     pub fn new(
         name: &str,
-        addr: Ipv4Addr,
+        addrs: Vec<IpAddr>,
         pcap_options: Option<PcapOptions>,
         qdisc: QDiscMode,
     ) -> Self {
@@ -89,7 +91,12 @@ impl NetworkInterface {
             }
         });
 
-        log::debug!("Bringing up network interface '{name}' at '{addr}' using {qdisc:?}");
+        let addrs_display = addrs
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::debug!("Bringing up network interface '{name}' at '{addrs_display}' using {qdisc:?}");
 
         let queue_kind = match qdisc {
             // A packet fifo is realized using a min-heap over monitonically increasing priority
@@ -106,7 +113,7 @@ impl NetworkInterface {
         };
 
         Self {
-            addr,
+            addrs,
             send_sockets: RefCell::new(NetworkQueue::new(queue_kind)),
             recv_sockets: RefCell::new(HashMap::new()),
             pcap: RefCell::new(pcap),
@@ -115,50 +122,66 @@ impl NetworkInterface {
         }
     }
 
+    /// Returns the interface's addresses that have the same address family as
+    /// `peer`.
+    fn addrs_for_peer(&self, peer: &SocketAddr) -> impl Iterator<Item = IpAddr> + '_ {
+        let peer_family = std::mem::discriminant(&peer.ip());
+        self.addrs
+            .iter()
+            .copied()
+            .filter(move |addr| std::mem::discriminant(addr) == peer_family)
+    }
+
     pub fn associate(
         &self,
         socket: &InetSocket,
         protocol: IanaProtocol,
         port: u16,
-        peer: SocketAddrV4,
+        peer: SocketAddr,
     ) {
-        let local = SocketAddrV4::new(self.addr, port);
-        let key = AssociatedSocketKey::new(protocol, local, peer);
-        log::trace!("Associating socket key {key:?}");
+        for addr in self.addrs_for_peer(&peer) {
+            let local = SocketAddr::new(addr, port);
+            let key = AssociatedSocketKey::new(protocol, local, peer);
+            log::trace!("Associating socket key {key:?}");
 
-        if let Entry::Vacant(entry) = self.recv_sockets.borrow_mut().entry(key) {
-            entry.insert(socket.clone());
-        } else {
-            // TODO: Return an error if the association fails.
-            warn_and_debug_panic!("Entry is unexpectedly occupied");
+            if let Entry::Vacant(entry) = self.recv_sockets.borrow_mut().entry(key) {
+                entry.insert(socket.clone());
+            } else {
+                // TODO: Return an error if the association fails.
+                warn_and_debug_panic!("Entry is unexpectedly occupied");
+            }
         }
     }
 
-    pub fn disassociate(&self, protocol: IanaProtocol, port: u16, peer: SocketAddrV4) {
+    pub fn disassociate(&self, protocol: IanaProtocol, port: u16, peer: SocketAddr) {
         if *self.cleanup_in_progress.borrow() {
             return;
         }
 
-        let local = SocketAddrV4::new(self.addr, port);
-        let key = AssociatedSocketKey::new(protocol, local, peer);
-        log::trace!("Disassociating socket key {key:?}");
+        for addr in self.addrs_for_peer(&peer) {
+            let local = SocketAddr::new(addr, port);
+            let key = AssociatedSocketKey::new(protocol, local, peer);
+            log::trace!("Disassociating socket key {key:?}");
 
-        // TODO: Return an error if the disassociation fails. Generally the calling code should only
-        // try to disassociate a socket if it thinks that the socket is actually associated with
-        // this interface, and if it's not, then it's probably an error. But TCP sockets will
-        // disassociate all sockets (including ones that have never been associated) and will try to
-        // disassociate the same socket multiple times, so we can't just add an assert here.
-        if self.recv_sockets.borrow_mut().remove(&key).is_none() {
-            // Since this always occurs with our legacy TCP stack and is not really a bug, we log at
-            // trace instead of warn level for now until the legacy TCP stack is removed.
-            log::trace!("Attempted to disassociate a vacant socket key");
+            // TODO: Return an error if the disassociation fails. Generally the calling code should only
+            // try to disassociate a socket if it thinks that the socket is actually associated with
+            // this interface, and if it's not, then it's probably an error. But TCP sockets will
+            // disassociate all sockets (including ones that have never been associated) and will try to
+            // disassociate the same socket multiple times, so we can't just add an assert here.
+            if self.recv_sockets.borrow_mut().remove(&key).is_none() {
+                // Since this always occurs with our legacy TCP stack and is not really a bug, we log at
+                // trace instead of warn level for now until the legacy TCP stack is removed.
+                log::trace!("Attempted to disassociate a vacant socket key");
+            }
         }
     }
 
-    pub fn is_addr_in_use(&self, protocol: IanaProtocol, port: u16, peer: SocketAddrV4) -> bool {
-        let local = SocketAddrV4::new(self.addr, port);
-        let key = AssociatedSocketKey::new(protocol, local, peer);
-        self.recv_sockets.borrow().contains_key(&key)
+    pub fn is_addr_in_use(&self, protocol: IanaProtocol, port: u16, peer: SocketAddr) -> bool {
+        self.addrs_for_peer(&peer).any(|addr| {
+            let local = SocketAddr::new(addr, port);
+            let key = AssociatedSocketKey::new(protocol, local, peer);
+            self.recv_sockets.borrow().contains_key(&key)
+        })
     }
 
     // Add the socket to the list of sockets that have data ready for us to send out to the network.
@@ -206,8 +229,8 @@ impl NetworkInterface {
                 // There was a non-recoverable error.
                 log::warn!("Unable to write packet to pcap output: {e}");
                 log::warn!(
-                    "Fatal pcap logging error; stopping pcap logging for interface '{}'.",
-                    self.addr
+                    "Fatal pcap logging error; stopping pcap logging for interface '{:?}'.",
+                    self.addrs
                 );
                 pcap_borrowed.take();
             }
@@ -216,8 +239,12 @@ impl NetworkInterface {
 }
 
 impl PacketDevice for NetworkInterface {
-    fn get_address(&self) -> Ipv4Addr {
-        self.addr
+    fn get_address(&self) -> IpAddr {
+        self.addrs.first().copied().unwrap()
+    }
+
+    fn has_address(&self, addr: IpAddr) -> bool {
+        self.addrs.contains(&addr)
     }
 
     // Pops a packet from the interface to send over the simulated network.
@@ -226,8 +253,8 @@ impl PacketDevice for NetworkInterface {
             // Choose the next socket that will send a packet.
             let Some(socket) = self.send_sockets.borrow_mut().pop() else {
                 log::trace!(
-                    "Interface {} is now idle with no sockets containing sendable packets.",
-                    self.addr
+                    "Interface {:?} is now idle with no sockets containing sendable packets.",
+                    self.addrs
                 );
                 return None;
             };
@@ -266,8 +293,8 @@ impl PacketDevice for NetworkInterface {
 
         // Find the socket that should process the packet.
         let protocol = packet.iana_protocol();
-        let local = SocketAddrV4::new(self.addr, packet.dst_ipv4_address().port());
-        let peer = packet.src_ipv4_address();
+        let local = packet.dst_address();
+        let peer = packet.src_address();
         let key = AssociatedSocketKey::new(protocol, local, peer);
 
         // First check for a socket with the specific association.
@@ -278,7 +305,14 @@ impl PacketDevice for NetworkInterface {
                 .get(&key)
                 .or_else(|| {
                     // Then fall back to checking for the wildcard association.
-                    let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                    let wildcard = match local.ip() {
+                        IpAddr::V4(_) => {
+                            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+                        }
+                        IpAddr::V6(_) => {
+                            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+                        }
+                    };
                     let key = AssociatedSocketKey::new(protocol, local, wildcard);
                     log::trace!("Looking for socket associated with general key {key:?}");
                     associated.get(&key)

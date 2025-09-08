@@ -3,7 +3,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsString};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::prelude::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,7 @@ pub struct HostInfo {
     pub id: HostId,
     pub name: String,
     pub default_ip: Ipv4Addr,
+    pub default_ip6: Ipv6Addr,
     pub log_level: Option<log::LevelFilter>,
 }
 
@@ -262,18 +263,19 @@ impl Host {
         // We already checked that the addresses are available, so fail if they are not.
 
         let public_ip: Ipv4Addr = u32::from_be(params.ip_addr).into();
+        let public_ip6: Ipv6Addr = Ipv6Addr::from(params.ip_addr6);
 
         let pcap_options = params.pcap_config.as_ref().map(|x| PcapOptions {
             path: data_dir_path.clone(),
             capture_size_bytes: x.capture_size.try_into().unwrap(),
         });
 
-        let net_ns = NetworkNamespace::new(public_ip, pcap_options, params.qdisc);
+        let net_ns = NetworkNamespace::new(public_ip, public_ip6, pcap_options, params.qdisc);
 
         // Packets that are not for localhost or our public ip go to the router.
         // Use `Ipv4Addr::UNSPECIFIED` for the router to encode this for our
         // routing table logic inside of `Host::get_packet_device()`.
-        let router = Router::new(Ipv4Addr::UNSPECIFIED);
+        let router = Router::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let relay_inet_out = Relay::new(
             RateLimit::BytesPerSecond(params.requested_bw_up_bits / 8),
             net_ns.internet.borrow().get_address(),
@@ -595,6 +597,7 @@ impl Host {
                 id: self.id(),
                 name: self.params.hostname.to_str().unwrap().to_owned(),
                 default_ip: self.default_ip(),
+                default_ip6: self.default_ip6(),
                 log_level: self.log_level(),
             })
         })
@@ -610,6 +613,10 @@ impl Host {
 
     pub fn default_ip(&self) -> Ipv4Addr {
         self.net_ns.default_ip
+    }
+
+    pub fn default_ip6(&self) -> Ipv6Addr {
+        self.net_ns.default_ip6
     }
 
     pub fn abstract_unix_namespace(
@@ -668,7 +675,7 @@ impl Host {
     /// Panics if we have shut down.
     pub fn interface_borrow_mut(
         &self,
-        addr: Ipv4Addr,
+        addr: IpAddr,
     ) -> Option<impl DerefMut<Target = NetworkInterface> + '_> {
         self.net_ns.interface_borrow_mut(addr)
     }
@@ -678,7 +685,7 @@ impl Host {
     /// Panics if we have shut down.
     pub fn interface_borrow(
         &self,
-        addr: Ipv4Addr,
+        addr: IpAddr,
     ) -> Option<impl Deref<Target = NetworkInterface> + '_> {
         self.net_ns.interface_borrow(addr)
     }
@@ -945,10 +952,12 @@ impl Host {
     /// that will receive and process packets with a given destination address.
     /// In the latter case, if the packet destination is not on this host, we
     /// return the router to route it to the correct host.
-    pub fn get_packet_device(&self, address: Ipv4Addr) -> Ref<'_, dyn PacketDevice> {
-        if address == Ipv4Addr::LOCALHOST {
+    pub fn get_packet_device(&self, address: IpAddr) -> Ref<'_, dyn PacketDevice> {
+        if address.is_loopback() {
             self.net_ns.localhost.borrow()
-        } else if address == self.default_ip() {
+        } else if address == IpAddr::from(self.default_ip())
+            || address == IpAddr::from(self.default_ip6())
+        {
             self.net_ns.internet.borrow()
         } else {
             self.router.borrow()
@@ -968,17 +977,18 @@ impl Host {
     /// WARNING: This is not reentrant. Do not allow this to be called recursively. Nothing in
     /// `add_data_source()` or `notify()` can call back into this method. This includes any socket
     /// code called in any indirect way from here.
-    pub fn notify_socket_has_packets(&self, addr: Ipv4Addr, socket: &InetSocket) {
+    pub fn notify_socket_has_packets(&self, addr: IpAddr, socket: &InetSocket) {
         if self.in_notify_socket_has_packets.replace(&self.root, true) {
             panic!("Recursively calling host.notify_socket_has_packets()");
         }
 
         if let Some(iface) = self.interface_borrow(addr) {
             iface.add_data_source(socket);
-            match addr {
-                Ipv4Addr::LOCALHOST => self.relay_loopback.notify(self),
-                _ => self.relay_inet_out.notify(self),
-            };
+            if addr.is_loopback() {
+                self.relay_loopback.notify(self);
+            } else {
+                self.relay_inet_out.notify(self);
+            }
         }
 
         self.in_notify_socket_has_packets.set(&self.root, false);
@@ -1148,8 +1158,8 @@ mod export {
         let bind_port = u16::from_be(bind_port);
         let peer_port = u16::from_be(peer_port);
 
-        let bind_addr = SocketAddrV4::new(bind_ip, bind_port);
-        let peer_addr = SocketAddrV4::new(peer_ip, peer_port);
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(bind_ip, bind_port));
+        let peer_addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, peer_port));
 
         let protocol = IanaProtocol::from(c_protocol);
 
@@ -1181,8 +1191,8 @@ mod export {
             .net_ns
             .get_random_free_port(
                 protocol,
-                interface_ip,
-                peer_addr,
+                IpAddr::V4(interface_ip),
+                SocketAddr::V4(peer_addr),
                 hostrc.random.borrow_mut().deref_mut(),
             )
             .unwrap_or(0)
@@ -1358,8 +1368,8 @@ mod export {
     ) {
         let host = unsafe { hostrc.as_ref().unwrap() };
         let socket = unsafe { socket.as_ref().unwrap() };
-        let addr = u32::from_be(addr).into();
-        host.notify_socket_has_packets(addr, socket);
+        let addr: Ipv4Addr = u32::from_be(addr).into();
+        host.notify_socket_has_packets(IpAddr::V4(addr), socket);
     }
 
     #[unsafe(no_mangle)]

@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 
 use atomic_refcell::AtomicRefCell;
@@ -15,6 +15,7 @@ use crate::core::worker::Worker;
 use crate::cshadow as c;
 use crate::host::descriptor::listener::{StateEventSource, StateListenHandle, StateListenerFilter};
 use crate::host::descriptor::socket::inet;
+use crate::host::descriptor::socket::inet::{addr_family, default_ip_for, loopback_for, wildcard_for};
 use crate::host::descriptor::socket::{InetSocket, RecvmsgArgs, RecvmsgReturn, SendmsgArgs};
 use crate::host::descriptor::{File, Socket};
 use crate::host::descriptor::{
@@ -39,6 +40,8 @@ pub struct TcpSocket {
     association: Option<AssociationHandle>,
     connect_result_is_pending: bool,
     shutdown_status: Option<Shutdown>,
+    /// The socket's address family, as given at socket creation time.
+    domain: linux_api::socket::AddressFamily,
     // should only be used by `OpenFile` to make sure there is only ever one `OpenFile` instance for
     // this file
     has_open_file: bool,
@@ -46,7 +49,7 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(status: FileStatus) -> Arc<AtomicRefCell<Self>> {
+    pub fn new(status: FileStatus, domain: linux_api::socket::AddressFamily) -> Arc<AtomicRefCell<Self>> {
         let rv = Arc::new_cyclic(|weak: &Weak<AtomicRefCell<Self>>| {
             let tcp_dependencies = TcpDeps {
                 timer_state: Arc::new(AtomicRefCell::new(TcpDepsTimerState {
@@ -66,6 +69,7 @@ impl TcpSocket {
                 association: None,
                 connect_result_is_pending: false,
                 shutdown_status: None,
+                domain,
                 has_open_file: false,
                 _counter: ObjectCounter::new("TcpSocket"),
             })
@@ -132,7 +136,7 @@ impl TcpSocket {
             // First try getting our IP address from the tcp state (if it's connected), then try
             // from the association handle (if it's not connected but is bound). Assume that our IP
             // address will match an interface's IP address.
-            let interface_ip = *self
+            let interface_ip = self
                 .tcp_state
                 .local_remote_addrs()
                 .map(|x| x.0)
@@ -208,7 +212,7 @@ impl TcpSocket {
         // the packet
 
         let header = packet
-            .ipv4_tcp_header()
+            .tcp_header()
             .expect("TCP socket received a non-tcp packet");
 
         // transfer the `Bytes` objects directly from the payload to the tcp state without copying
@@ -261,7 +265,7 @@ impl TcpSocket {
         // We transfer the `Bytes` objects directly from the tcp state's `Payload` object to the
         // packet without copying the bytes themselves.
         // TODO: set packet priority?
-        let packet = PacketRc::new_ipv4_tcp(header, payload, 0);
+        let packet = PacketRc::new_tcp(header, payload, 0);
         packet.add_status(PacketStatus::SndCreated);
 
         Some(packet)
@@ -276,19 +280,22 @@ impl TcpSocket {
         self.tcp_state.wants_to_send()
     }
 
-    pub fn getsockname(&self) -> Result<Option<SockaddrIn>, Errno> {
+    pub fn getsockname(&self) -> Result<Option<SockaddrStorage>, Errno> {
         // The socket state won't always have the local address. For example if the socket was bound
         // but connect() hasn't yet been called, the socket state will not have a local or remote
         // address. Instead we should get the local address from the association.
-        Ok(Some(
-            self.association
-                .as_ref()
-                .map(|x| x.local_addr().into())
-                .unwrap_or(SockaddrIn::new(0, 0, 0, 0, 0)),
-        ))
+        let addr = self
+            .association
+            .as_ref()
+            .map(|x| x.local_addr())
+            .unwrap_or(SocketAddr::new(
+                wildcard_for(self.address_family()),
+                0,
+            ));
+        Ok(Some(addr.into()))
     }
 
-    pub fn getpeername(&self) -> Result<Option<SockaddrIn>, Errno> {
+    pub fn getpeername(&self) -> Result<Option<SockaddrStorage>, Errno> {
         // The association won't always have the peer address. For example if the socket was bound
         // before connect() was called, the association will have a peer of 0.0.0.0. Instead we
         // should get the peer address from the socket state.
@@ -308,7 +315,7 @@ impl TcpSocket {
     }
 
     pub fn address_family(&self) -> linux_api::socket::AddressFamily {
-        linux_api::socket::AddressFamily::AF_INET
+        self.domain
     }
 
     pub fn close(&mut self, cb_queue: &mut CallbackQueue) -> Result<(), SyscallError> {
@@ -339,13 +346,16 @@ impl TcpSocket {
         };
 
         // if not an inet socket address
-        let Some(addr) = addr.as_inet() else {
+        let Some(addr) = addr.as_std_inet() else {
             return Err(Errno::EINVAL.into());
         };
 
-        let addr: SocketAddrV4 = (*addr).into();
-
         let mut socket_ref = socket.borrow_mut();
+
+        // the address family must match the socket's domain
+        if addr_family(addr.ip()) != socket_ref.domain {
+            return Err(Errno::EINVAL.into());
+        }
 
         // if the socket is already associated
         if socket_ref.association.is_some() {
@@ -353,7 +363,7 @@ impl TcpSocket {
         }
 
         // this will allow us to receive packets from any peer
-        let peer_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        let peer_addr = SocketAddr::new(wildcard_for(addr_family(addr.ip())), 0);
 
         // associate the socket
         let (_addr, handle) = inet::associate_socket(
@@ -560,6 +570,7 @@ impl TcpSocket {
         let backlog = backlog as u32;
 
         let is_associated = socket_ref.association.is_some();
+        let domain = socket_ref.domain;
 
         let rv = if is_associated {
             // if already associated, do nothing
@@ -569,10 +580,10 @@ impl TcpSocket {
             // if not associated, associate and return the handle
             let associate_fn = || {
                 // implicitly bind to all interfaces
-                let local_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let local_addr = SocketAddr::new(wildcard_for(domain), 0);
 
                 // want to receive packets from any address
-                let peer_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let peer_addr = SocketAddr::new(wildcard_for(domain), 0);
                 let socket = Arc::clone(socket);
 
                 // associate the socket
@@ -643,16 +654,21 @@ impl TcpSocket {
         }
 
         // if not an inet socket address
-        let Some(peer_addr) = peer_addr.as_inet() else {
+        let Some(peer_addr) = peer_addr.as_std_inet() else {
             return Err(Errno::EINVAL.into());
         };
 
-        let mut peer_addr: std::net::SocketAddrV4 = (*peer_addr).into();
+        // the address family must match the socket's domain
+        if addr_family(peer_addr.ip()) != socket_ref.domain {
+            return Err(Errno::EINVAL.into());
+        }
 
-        // On Linux a connection to 0.0.0.0 means a connection to localhost:
+        let mut peer_addr = peer_addr;
+
+        // On Linux a connection to 0.0.0.0 (or ::) means a connection to localhost:
         // https://stackoverflow.com/a/22425796
         if peer_addr.ip().is_unspecified() {
-            peer_addr.set_ip(std::net::Ipv4Addr::LOCALHOST);
+            peer_addr.set_ip(loopback_for(addr_family(peer_addr.ip())));
         }
 
         let local_addr = socket_ref.association.as_ref().map(|x| x.local_addr());
@@ -661,10 +677,10 @@ impl TcpSocket {
             // the local address needs to be a specific address (this is normally what a routing
             // table would figure out for us)
             if local_addr.ip().is_unspecified() {
-                if peer_addr.ip() == &std::net::Ipv4Addr::LOCALHOST {
-                    local_addr.set_ip(Ipv4Addr::LOCALHOST)
+                if peer_addr.ip().is_loopback() {
+                    local_addr.set_ip(loopback_for(addr_family(peer_addr.ip())))
                 } else {
-                    local_addr.set_ip(net_ns.default_ip)
+                    local_addr.set_ip(default_ip_for(addr_family(peer_addr.ip()), net_ns))
                 };
             }
 
@@ -676,14 +692,14 @@ impl TcpSocket {
             let associate_fn = || {
                 // the local address needs to be a specific address (this is normally what a routing
                 // table would figure out for us)
-                let local_addr = if peer_addr.ip() == &std::net::Ipv4Addr::LOCALHOST {
-                    Ipv4Addr::LOCALHOST
+                let local_addr = if peer_addr.ip().is_loopback() {
+                    loopback_for(addr_family(peer_addr.ip()))
                 } else {
-                    net_ns.default_ip
+                    default_ip_for(addr_family(peer_addr.ip()), net_ns)
                 };
 
                 // add a wildcard port number
-                let local_addr = SocketAddrV4::new(local_addr, 0);
+                let local_addr = SocketAddr::new(local_addr, 0);
 
                 let (local_addr, handle) = inet::associate_socket(
                     InetSocket::Tcp(Arc::clone(socket)),
@@ -787,6 +803,7 @@ impl TcpSocket {
                 association: None,
                 connect_result_is_pending: false,
                 shutdown_status: None,
+                domain: self.address_family(),
                 has_open_file: false,
                 _counter: ObjectCounter::new("TcpSocket"),
             })

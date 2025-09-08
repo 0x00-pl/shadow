@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -30,22 +30,39 @@ pub struct NetworkNamespace {
     pub internet: RefCell<NetworkInterface>,
 
     pub default_ip: Ipv4Addr,
+    pub default_ip6: Ipv6Addr,
 
     // used for debugging to make sure we've cleaned up before being dropped
     has_run_cleanup: Cell<bool>,
 }
 
 impl NetworkNamespace {
-    pub fn new(public_ip: Ipv4Addr, pcap: Option<PcapOptions>, qdisc: QDiscMode) -> Self {
-        let localhost = NetworkInterface::new("lo", Ipv4Addr::LOCALHOST, pcap.clone(), qdisc);
+    pub fn new(
+        public_ip: Ipv4Addr,
+        public_ip6: Ipv6Addr,
+        pcap: Option<PcapOptions>,
+        qdisc: QDiscMode,
+    ) -> Self {
+        let localhost = NetworkInterface::new(
+            "lo",
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)],
+            pcap.clone(),
+            qdisc,
+        );
 
-        let internet = NetworkInterface::new("eth0", public_ip, pcap, qdisc);
+        let internet = NetworkInterface::new(
+            "eth0",
+            vec![IpAddr::V4(public_ip), IpAddr::V6(public_ip6)],
+            pcap,
+            qdisc,
+        );
 
         Self {
             unix: Arc::new(AtomicRefCell::new(AbstractUnixNamespace::new())),
             localhost: RefCell::new(localhost),
             internet: RefCell::new(internet),
             default_ip: public_ip,
+            default_ip6: public_ip6,
             has_run_cleanup: Cell::new(false),
         }
     }
@@ -67,7 +84,7 @@ impl NetworkNamespace {
     #[track_caller]
     pub fn interface_borrow(
         &self,
-        addr: Ipv4Addr,
+        addr: IpAddr,
     ) -> Option<impl Deref<Target = NetworkInterface> + '_> {
         // Notes:
         // - The `is_loopback` matches all loopback addresses, but shadow will only work correctly
@@ -78,7 +95,10 @@ impl NetworkNamespace {
         //   instead of loopback. It's not clear if this will lead to bugs.
         if addr.is_loopback() {
             Some(self.localhost.borrow())
-        } else if addr == self.default_ip || addr.is_unspecified() {
+        } else if addr == IpAddr::from(self.default_ip)
+            || addr == IpAddr::from(self.default_ip6)
+            || addr.is_unspecified()
+        {
             Some(self.internet.borrow())
         } else {
             None
@@ -89,7 +109,7 @@ impl NetworkNamespace {
     #[track_caller]
     pub fn interface_borrow_mut(
         &self,
-        addr: Ipv4Addr,
+        addr: IpAddr,
     ) -> Option<impl DerefMut<Target = NetworkInterface> + '_> {
         // Notes:
         // - The `is_loopback` matches all loopback addresses, but shadow will only work correctly
@@ -100,7 +120,10 @@ impl NetworkNamespace {
         //   instead of loopback. It's not clear if this will lead to bugs.
         if addr.is_loopback() {
             Some(self.localhost.borrow_mut())
-        } else if addr == self.default_ip || addr.is_unspecified() {
+        } else if addr == IpAddr::from(self.default_ip)
+            || addr == IpAddr::from(self.default_ip6)
+            || addr.is_unspecified()
+        {
             Some(self.internet.borrow_mut())
         } else {
             None
@@ -110,8 +133,8 @@ impl NetworkNamespace {
     pub fn is_addr_in_use(
         &self,
         protocol_type: IanaProtocol,
-        src: SocketAddrV4,
-        dst: SocketAddrV4,
+        src: SocketAddr,
+        dst: SocketAddr,
     ) -> Result<bool, NoInterface> {
         if src.ip().is_unspecified() {
             Ok(self
@@ -123,7 +146,7 @@ impl NetworkNamespace {
                     .borrow()
                     .is_addr_in_use(protocol_type, src.port(), dst))
         } else {
-            match self.interface_borrow(*src.ip()) {
+            match self.interface_borrow(src.ip()) {
                 Some(i) => Ok(i.is_addr_in_use(protocol_type, src.port(), dst)),
                 None => Err(NoInterface),
             }
@@ -134,8 +157,8 @@ impl NetworkNamespace {
     pub fn get_random_free_port(
         &self,
         protocol_type: IanaProtocol,
-        interface_ip: Ipv4Addr,
-        peer: SocketAddrV4,
+        interface_ip: IpAddr,
+        peer: SocketAddr,
         mut rng: impl rand::RngExt,
     ) -> Option<u16> {
         // we need a random port that is free everywhere we need it to be.
@@ -145,6 +168,7 @@ impl NetworkNamespace {
 
         // if choosing randomly doesn't succeed within 10 tries, then we have already
         // allocated a lot of ports (>90% on average). then we fall back to linear search.
+        let wildcard_peer = SocketAddr::new(unspecified_like(interface_ip), 0);
         for _ in 0..10 {
             let random_port = rng.random_range(MIN_RANDOM_PORT..=u16::MAX);
 
@@ -152,15 +176,15 @@ impl NetworkNamespace {
             let specific_in_use = self
                 .is_addr_in_use(
                     protocol_type,
-                    SocketAddrV4::new(interface_ip, random_port),
+                    SocketAddr::new(interface_ip, random_port),
                     peer,
                 )
                 .unwrap_or(true);
             let generic_in_use = self
                 .is_addr_in_use(
                     protocol_type,
-                    SocketAddrV4::new(interface_ip, random_port),
-                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                    SocketAddr::new(interface_ip, random_port),
+                    wildcard_peer,
                 )
                 .unwrap_or(true);
             if !specific_in_use && !generic_in_use {
@@ -174,13 +198,17 @@ impl NetworkNamespace {
         let start = rng.random_range(MIN_RANDOM_PORT..=u16::MAX);
         for port in (start..=u16::MAX).chain(MIN_RANDOM_PORT..start) {
             let specific_in_use = self
-                .is_addr_in_use(protocol_type, SocketAddrV4::new(interface_ip, port), peer)
+                .is_addr_in_use(
+                    protocol_type,
+                    SocketAddr::new(interface_ip, port),
+                    peer,
+                )
                 .unwrap_or(true);
             let generic_in_use = self
                 .is_addr_in_use(
                     protocol_type,
-                    SocketAddrV4::new(interface_ip, port),
-                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                    SocketAddr::new(interface_ip, port),
+                    wildcard_peer,
                 )
                 .unwrap_or(true);
             if !specific_in_use && !generic_in_use {
@@ -202,8 +230,8 @@ impl NetworkNamespace {
         &self,
         socket: &InetSocket,
         protocol: IanaProtocol,
-        bind_addr: SocketAddrV4,
-        peer_addr: SocketAddrV4,
+        bind_addr: SocketAddr,
+        peer_addr: SocketAddr,
     ) -> AssociationHandle {
         if bind_addr.ip().is_unspecified() {
             // need to associate all interfaces
@@ -215,7 +243,7 @@ impl NetworkNamespace {
                 .associate(socket, protocol, bind_addr.port(), peer_addr);
         } else {
             // TODO: return error if interface does not exist
-            if let Some(iface) = self.interface_borrow(*bind_addr.ip()) {
+            if let Some(iface) = self.interface_borrow(bind_addr.ip()) {
                 iface.associate(socket, protocol, bind_addr.port(), peer_addr);
             }
         }
@@ -235,8 +263,8 @@ impl NetworkNamespace {
     pub fn disassociate_interface(
         &self,
         protocol: IanaProtocol,
-        bind_addr: SocketAddrV4,
-        peer_addr: SocketAddrV4,
+        bind_addr: SocketAddr,
+        peer_addr: SocketAddr,
     ) {
         if bind_addr.ip().is_unspecified() {
             // need to disassociate all interfaces
@@ -249,7 +277,7 @@ impl NetworkNamespace {
                 .disassociate(protocol, bind_addr.port(), peer_addr);
         } else {
             // TODO: return error if interface does not exist
-            if let Some(iface) = self.interface_borrow(*bind_addr.ip()) {
+            if let Some(iface) = self.interface_borrow(bind_addr.ip()) {
                 iface.disassociate(protocol, bind_addr.port(), peer_addr);
             }
         }
@@ -261,6 +289,15 @@ impl std::ops::Drop for NetworkNamespace {
         if !self.has_run_cleanup.get() && !std::thread::panicking() {
             warn_and_debug_panic!("Dropped the network namespace before it has been cleaned up");
         }
+    }
+}
+
+/// Returns the unspecified (wildcard) address with the same address family as
+/// `addr`.
+fn unspecified_like(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     }
 }
 
@@ -282,16 +319,16 @@ impl std::error::Error for NoInterface {}
 #[derive(Debug)]
 pub struct AssociationHandle {
     protocol: IanaProtocol,
-    local_addr: SocketAddrV4,
-    remote_addr: SocketAddrV4,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
 }
 
 impl AssociationHandle {
-    pub fn local_addr(&self) -> SocketAddrV4 {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    pub fn remote_addr(&self) -> SocketAddrV4 {
+    pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 }

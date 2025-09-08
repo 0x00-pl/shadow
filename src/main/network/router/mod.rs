@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::net::Ipv4Addr;
 
 use self::codel_queue::CoDelQueue;
 use crate::core::worker::Worker;
@@ -8,6 +7,8 @@ use crate::network::packet::PacketRc;
 use crate::utility::{Magic, ObjectCounter};
 mod codel_queue;
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use shadow_shim_helper_rs::emulated_time::EmulatedTime;
 
 /// A router assists with moving packets between hosts across the simulated
@@ -15,7 +16,7 @@ use shadow_shim_helper_rs::emulated_time::EmulatedTime;
 pub struct Router {
     magic: Magic<Self>,
     _counter: ObjectCounter,
-    address: Ipv4Addr,
+    address: IpAddr,
     /// Packets inbound to the host from the simulated network.
     inbound_packets: RefCell<CoDelQueue>,
 }
@@ -24,7 +25,7 @@ impl Router {
     /// Create a new router for a host that will help route packets between it
     /// and other hosts. The `address` must uniquely identify this router to the
     /// host that owns it.
-    pub fn new(address: Ipv4Addr) -> Router {
+    pub fn new(address: IpAddr) -> Router {
         Router {
             magic: Magic::new(),
             address,
@@ -58,7 +59,7 @@ impl Router {
 }
 
 impl PacketDevice for Router {
-    fn get_address(&self) -> Ipv4Addr {
+    fn get_address(&self) -> IpAddr {
         self.address
     }
 
@@ -81,7 +82,7 @@ mod tests {
     #[test]
     fn empty() {
         let now = mock_time_millis(1000);
-        let router = Router::new(Ipv4Addr::UNSPECIFIED);
+        let router = Router::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(router.inbound_packets.borrow().peek().is_none());
         assert!(router.pop_inner(now).is_none());
     }
@@ -91,7 +92,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn push_pop_simple() {
         let now = mock_time_millis(1000);
-        let router = Router::new(Ipv4Addr::UNSPECIFIED);
+        let router = Router::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
         const N: usize = 10;
 

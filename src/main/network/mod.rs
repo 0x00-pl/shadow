@@ -3,7 +3,7 @@
 //! This contains code that simulates the Internet and upstream routers. It does not contain any
 //! emulation of Linux networking behaviour, which exists in the [`crate::host`] module.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use crate::network::packet::PacketRc;
 
@@ -14,7 +14,15 @@ pub mod relay;
 pub mod router;
 
 pub trait PacketDevice {
-    fn get_address(&self) -> Ipv4Addr;
+    /// The device's primary address. Devices that support multiple addresses
+    /// (for example IPv4 and IPv6) should also override [`Self::has_address`].
+    fn get_address(&self) -> IpAddr;
+
+    /// Returns whether this device handles packets addressed to `addr`.
+    fn has_address(&self, addr: IpAddr) -> bool {
+        self.get_address() == addr
+    }
+
     fn pop(&self) -> Option<PacketRc>;
     fn push(&self, packet: PacketRc);
 }

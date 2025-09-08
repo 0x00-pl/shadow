@@ -1,6 +1,6 @@
 use std::collections::LinkedList;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -16,6 +16,7 @@ use crate::core::worker::Worker;
 use crate::cshadow as c;
 use crate::host::descriptor::listener::{StateEventSource, StateListenHandle, StateListenerFilter};
 use crate::host::descriptor::socket::inet::{self, InetSocket};
+use crate::host::descriptor::socket::inet::{addr_family, default_ip_for, loopback_for, wildcard_for};
 use crate::host::descriptor::socket::{RecvmsgArgs, RecvmsgReturn, SendmsgArgs, ShutdownFlags};
 use crate::host::descriptor::{
     File, FileMode, FileSignals, FileState, FileStatus, OpenFile, Socket, SyscallResult,
@@ -41,9 +42,14 @@ pub struct UdpSocket {
     shutdown_status: ShutdownFlags,
     send_buffer: MessageBuffer<MessageSendHeader>,
     recv_buffer: MessageBuffer<MessageRecvHeader>,
-    peer_addr: Option<SocketAddrV4>,
-    bound_addr: Option<SocketAddrV4>,
+    peer_addr: Option<SocketAddr>,
+    bound_addr: Option<SocketAddr>,
     association: Option<AssociationHandle>,
+    /// The socket's address family, as given at socket creation time.
+    domain: linux_api::socket::AddressFamily,
+    /// The value of the `IPV6_V6ONLY` socket option. Only meaningful for
+    /// IPv6 sockets.
+    ipv6_only: bool,
     /// The receive time of the last packet returned to the managed process during a call to
     /// `recvmsg()`. Used for `SIOCGSTAMP`.
     recv_time_of_last_read_packet: Option<EmulatedTime>,
@@ -58,6 +64,7 @@ impl UdpSocket {
         status: FileStatus,
         send_buf_size: usize,
         recv_buf_size: usize,
+        domain: linux_api::socket::AddressFamily,
     ) -> Arc<AtomicRefCell<Self>> {
         let mut socket = Self {
             event_source: StateEventSource::new(),
@@ -69,6 +76,8 @@ impl UdpSocket {
             peer_addr: None,
             bound_addr: None,
             association: None,
+            domain,
+            ipv6_only: false,
             recv_time_of_last_read_packet: None,
             has_open_file: false,
             _counter: ObjectCounter::new("UdpSocket"),
@@ -114,7 +123,7 @@ impl UdpSocket {
         packet.add_status(PacketStatus::RcvSocketProcessed);
 
         if let Some(peer_addr) = self.peer_addr
-            && peer_addr != packet.src_ipv4_address()
+            && peer_addr != packet.src_address()
         {
             // connect(2): "If the socket sockfd is of type SOCK_DGRAM, then addr is the address
             // to which datagrams are sent by default, and the only address from which datagrams
@@ -151,8 +160,8 @@ impl UdpSocket {
         let message = payload.concat();
 
         let header = MessageRecvHeader {
-            src: packet.src_ipv4_address(),
-            dst: packet.dst_ipv4_address(),
+            src: packet.src_address(),
+            dst: packet.dst_address(),
             recv_time,
         };
 
@@ -179,8 +188,7 @@ impl UdpSocket {
         log::trace!("Removed a message from the UDP socket's send buffer");
 
         // We transfer the `Bytes` directly from the buffer to the packet without copying them.
-        let packet =
-            PacketRc::new_ipv4_udp(header.src, header.dst, message, header.packet_priority);
+        let packet = PacketRc::new_udp(header.src, header.dst, message, header.packet_priority);
         packet.add_status(PacketStatus::SndCreated);
 
         self.refresh_readable_writable(FileSignals::empty(), cb_queue);
@@ -196,28 +204,28 @@ impl UdpSocket {
         !self.send_buffer.is_empty()
     }
 
-    pub fn getsockname(&self) -> Result<Option<SockaddrIn>, Errno> {
+    pub fn getsockname(&self) -> Result<Option<SockaddrStorage>, Errno> {
         let mut addr = self
             .bound_addr
-            .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+            .unwrap_or_else(|| SocketAddr::new(wildcard_for(self.domain), 0));
 
-        // if we are bound to INADDR_ANY, we should instead return the IP used to communicate with
-        // the connected peer (if we have one)
-        if *addr.ip() == Ipv4Addr::UNSPECIFIED
+        // if we are bound to INADDR_ANY (or ::), we should instead return the IP used to
+        // communicate with the connected peer (if we have one)
+        if addr.ip().is_unspecified()
             && let Some(peer_addr) = self.peer_addr
         {
-            addr.set_ip(*peer_addr.ip());
+            addr.set_ip(peer_addr.ip());
         }
 
         Ok(Some(addr.into()))
     }
 
-    pub fn getpeername(&self) -> Result<Option<SockaddrIn>, Errno> {
+    pub fn getpeername(&self) -> Result<Option<SockaddrStorage>, Errno> {
         Ok(Some(self.peer_addr.ok_or(Errno::ENOTCONN)?.into()))
     }
 
     pub fn address_family(&self) -> linux_api::socket::AddressFamily {
-        linux_api::socket::AddressFamily::AF_INET
+        self.domain
     }
 
     pub fn close(&mut self, cb_queue: &mut CallbackQueue) -> Result<(), SyscallError> {
@@ -245,14 +253,17 @@ impl UdpSocket {
         };
 
         // if not an inet socket address
-        let Some(addr) = addr.as_inet() else {
+        let Some(addr) = addr.as_std_inet() else {
             return Err(Errno::EINVAL.into());
         };
 
-        let addr: SocketAddrV4 = (*addr).into();
-
         {
             let socket = socket.borrow();
+
+            // the address family must match the socket's domain
+            if addr_family(addr.ip()) != socket.domain {
+                return Err(Errno::EINVAL.into());
+            }
 
             // if the socket is already bound
             if socket.bound_addr.is_some() {
@@ -268,7 +279,7 @@ impl UdpSocket {
         }
 
         // this will allow us to receive packets from any peer
-        let unspecified_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        let unspecified_addr = SocketAddr::new(wildcard_for(addr_family(addr.ip())), 0);
 
         // associate the socket
         let (addr, handle) = inet::associate_socket(
@@ -341,9 +352,9 @@ impl UdpSocket {
         // TODO: If we have a peer AND a destination address is provided, should we use the peer or
         // the destination address? Do we have a test for this?
         let dst_addr = match args.addr {
-            Some(addr) => match addr.as_inet() {
+            Some(addr) => match addr.as_std_inet() {
                 // an inet socket address
-                Some(x) => (*x).into(),
+                Some(x) => x,
                 // not an inet socket address
                 None => return Err(Errno::EAFNOSUPPORT.into()),
             },
@@ -353,6 +364,11 @@ impl UdpSocket {
                 None => return Err(Errno::EDESTADDRREQ.into()),
             },
         };
+
+        // the destination address family must match the socket's domain
+        if addr_family(dst_addr.ip()) != socket_ref.domain {
+            return Err(Errno::EAFNOSUPPORT.into());
+        }
 
         if socket_ref.status().contains(FileStatus::O_NONBLOCK) {
             flags.insert(MsgFlags::MSG_DONTWAIT);
@@ -372,16 +388,16 @@ impl UdpSocket {
 
             // make sure the new peer address is connectable from the bound interface
             if !bound_addr.ip().is_unspecified() {
-                // assume that a socket bound to 0.0.0.0 can connect anywhere, so only check
-                // localhost
+                // assume that a socket bound to a wildcard address can connect anywhere, so only
+                // check loopback
                 match (
-                    bound_addr.ip() == &Ipv4Addr::LOCALHOST,
-                    dst_addr.ip() == &Ipv4Addr::LOCALHOST,
+                    bound_addr.ip().is_loopback(),
+                    dst_addr.ip().is_loopback(),
                 ) {
                     // bound and peer on loopback interface
                     (true, true) => {}
                     // neither bound nor peer on loopback interface (shadow treats any
-                    // non-127.0.0.1 address as an "internet" address)
+                    // non-loopback address as an "internet" address)
                     (false, false) => {}
                     _ => return Err(Errno::EINVAL.into()),
                 }
@@ -391,11 +407,11 @@ impl UdpSocket {
             assert!(socket_ref.peer_addr.is_none());
             assert!(socket_ref.association.is_none());
 
-            // implicit bind to 0.0.0.0
-            let local_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            // implicit bind to the wildcard address
+            let local_addr = SocketAddr::new(wildcard_for(socket_ref.domain), 0);
 
             // this will allow us to receive packets from any peer
-            let unspecified_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            let unspecified_addr = SocketAddr::new(wildcard_for(socket_ref.domain), 0);
 
             let (local_addr, handle) = super::associate_socket(
                 InetSocket::Udp(Arc::clone(socket)),
@@ -430,12 +446,18 @@ impl UdpSocket {
 
             let src_addr = socket_ref.bound_addr.unwrap();
             let src_addr = if src_addr.ip().is_unspecified() {
-                // depending on the destination address, choose either localhost or the public IP
-                // address
-                if dst_addr.ip() == &std::net::Ipv4Addr::LOCALHOST {
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, src_addr.port())
+                // depending on the destination address, choose either the loopback or the
+                // interface's default address for the destination's address family
+                if dst_addr.ip().is_loopback() {
+                    SocketAddr::new(
+                        loopback_for(addr_family(dst_addr.ip())),
+                        src_addr.port(),
+                    )
                 } else {
-                    SocketAddrV4::new(net_ns.default_ip, src_addr.port())
+                    SocketAddr::new(
+                        default_ip_for(addr_family(dst_addr.ip()), net_ns),
+                        src_addr.port(),
+                    )
                 }
             } else {
                 src_addr
@@ -456,7 +478,7 @@ impl UdpSocket {
 
             // notify the host that this socket has packets to send
             let socket = Arc::clone(socket);
-            let interface_ip = *socket_ref.bound_addr.unwrap().ip();
+            let interface_ip = socket_ref.bound_addr.unwrap().ip();
             cb_queue.add(move |_cb_queue| {
                 Worker::with_active_host(|host| {
                     let socket = InetSocket::Udp(socket);
@@ -688,26 +710,32 @@ impl UdpSocket {
     ) -> Result<(), SyscallError> {
         // if not an inet socket address
         // TODO: handle an AF_UNSPEC socket address
-        let Some(peer_addr) = peer_addr.as_inet() else {
+        let Some(peer_addr) = peer_addr.as_std_inet() else {
             return Err(Errno::EINVAL.into());
         };
 
-        let mut peer_addr: std::net::SocketAddrV4 = (*peer_addr).into();
+        let mut socket_borrow = socket.borrow_mut();
+
+        // the address family must match the socket's domain
+        if addr_family(peer_addr.ip()) != socket_borrow.domain {
+            return Err(Errno::EINVAL.into());
+        }
+        drop(socket_borrow);
+
+        let mut peer_addr = peer_addr;
 
         // https://stackoverflow.com/a/22425796
         if peer_addr.ip().is_unspecified() {
-            peer_addr.set_ip(std::net::Ipv4Addr::LOCALHOST);
+            peer_addr.set_ip(loopback_for(addr_family(peer_addr.ip())));
         }
-
-        // NOTE: it would be nice to use `Ipv4Addr::is_loopback` in this code rather than comparing
-        // to `Ipv4Addr::LOCALHOST`, but the rest of Shadow probably can't handle other loopback
-        // addresses (ex: 127.0.0.2) and it's probably best not to change this behaviour
 
         // make sure we will be able to route this later
         // TODO: UDP sockets probably shouldn't return `ECONNREFUSED`
-        if peer_addr.ip() != &std::net::Ipv4Addr::LOCALHOST {
-            let is_routable =
-                Worker::is_routable(net_ns.default_ip.into(), (*peer_addr.ip()).into());
+        if !peer_addr.ip().is_loopback() {
+            let is_routable = Worker::is_routable(
+                default_ip_for(addr_family(peer_addr.ip()), net_ns),
+                peer_addr.ip(),
+            );
 
             if !is_routable {
                 // can't route it - there is no node with this address
@@ -728,16 +756,16 @@ impl UdpSocket {
 
                 // make sure the new peer address is connectable from the bound interface
                 if !bound_addr.ip().is_unspecified() {
-                    // assume that a socket bound to 0.0.0.0 can connect anywhere, so only check
-                    // localhost
+                    // assume that a socket bound to a wildcard address can connect anywhere, so
+                    // only check loopback
                     match (
-                        bound_addr.ip() == &Ipv4Addr::LOCALHOST,
-                        peer_addr.ip() == &Ipv4Addr::LOCALHOST,
+                        bound_addr.ip().is_loopback(),
+                        peer_addr.ip().is_loopback(),
                     ) {
                         // bound and peer on loopback interface
                         (true, true) => {}
                         // neither bound nor peer on loopback interface (shadow treats any
-                        // non-127.0.0.1 address as an "internet" address)
+                        // non-loopback address as an "internet" address)
                         (false, false) => {}
                         _ => return Err(Errno::EINVAL.into()),
                     }
@@ -747,16 +775,16 @@ impl UdpSocket {
                 assert!(socket_ref.peer_addr.is_none());
                 assert!(socket_ref.association.is_none());
 
-                // implicit bind (use default interface unless the remote peer is on loopback)
-                let local_addr = if peer_addr.ip() == &std::net::Ipv4Addr::LOCALHOST {
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)
+                // implicit bind (use the default interface unless the remote peer is on loopback)
+                let local_addr = if peer_addr.ip().is_loopback() {
+                    SocketAddr::new(loopback_for(addr_family(peer_addr.ip())), 0)
                 } else {
-                    SocketAddrV4::new(net_ns.default_ip, 0)
+                    SocketAddr::new(default_ip_for(addr_family(peer_addr.ip()), net_ns), 0)
                 };
 
                 // this will allow us to receive packets from any source address, but
                 // `push_in_packet` should drop any packets that aren't from the peer
-                let unspecified_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let unspecified_addr = SocketAddr::new(wildcard_for(socket_ref.domain), 0);
 
                 let (local_addr, handle) = super::associate_socket(
                     InetSocket::Udp(Arc::clone(socket)),
@@ -844,7 +872,7 @@ impl UdpSocket {
                 Ok(bytes_written as libc::socklen_t)
             }
             (libc::SOL_SOCKET, libc::SO_DOMAIN) => {
-                let domain = libc::AF_INET;
+                let domain: libc::c_int = u16::from(self.address_family()) as libc::c_int;
 
                 let optval_ptr = optval_ptr.cast::<libc::c_int>();
                 let bytes_written = write_partial(mem, &domain, optval_ptr, optlen as usize)?;
@@ -877,6 +905,14 @@ impl UdpSocket {
                 let optval_ptr = optval_ptr.cast::<libc::c_int>();
                 // we don't support broadcast sockets, so just just return the default 0
                 let bytes_written = write_partial(mem, &0, optval_ptr, optlen as usize)?;
+
+                Ok(bytes_written as libc::socklen_t)
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) => {
+                let val: libc::c_int = self.ipv6_only.into();
+
+                let optval_ptr = optval_ptr.cast::<libc::c_int>();
+                let bytes_written = write_partial(mem, &val, optval_ptr, optlen as usize)?;
 
                 Ok(bytes_written as libc::socklen_t)
             }
@@ -998,6 +1034,23 @@ impl UdpSocket {
                     );
                 }
             }
+            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) => {
+                type OptType = libc::c_int;
+
+                if usize::try_from(optlen).unwrap() < std::mem::size_of::<OptType>() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                let optval_ptr = optval_ptr.cast::<OptType>();
+                let val: libc::c_int = mem.read(optval_ptr)?;
+
+                // the option can only be set before a socket is bound
+                if self.bound_addr.is_some() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                self.ipv6_only = val != 0;
+            }
             _ => {
                 log_once_per_value_at_level!(
                     (level, optname),
@@ -1101,9 +1154,9 @@ impl UdpSocket {
 struct MessageSendHeader {
     /// The source address (typically the bind address). The application can theoretically use
     /// `IP_PKTINFO` to set a per-message source address.
-    src: SocketAddrV4,
+    src: SocketAddr,
     /// The destination address (for example the peer).
-    dst: SocketAddrV4,
+    dst: SocketAddr,
     /// The priority for the packet that we'll create in the future, given to us by the host.
     packet_priority: FifoPacketPriority,
 }
@@ -1112,11 +1165,11 @@ struct MessageSendHeader {
 #[derive(Debug)]
 struct MessageRecvHeader {
     /// The source address (for example the peer).
-    src: SocketAddrV4,
+    src: SocketAddr,
     /// The destination address (typically the bind address). The application can theoretically use
     /// `IP_PKTINFO` to get the packet destination address.
     #[allow(dead_code)]
-    dst: SocketAddrV4,
+    dst: SocketAddr,
     /// The time when the network interface received the message.
     recv_time: EmulatedTime,
 }

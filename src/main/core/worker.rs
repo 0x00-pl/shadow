@@ -334,14 +334,14 @@ impl Worker {
             return;
         }
 
-        let src_ip = *packetrc.src_ipv4_address().ip();
-        let dst_ip = *packetrc.dst_ipv4_address().ip();
+        let src_ip = packetrc.src_address().ip();
+        let dst_ip = packetrc.dst_address().ip();
         let payload_size = packetrc.payload_len();
 
-        let Some(dst_host_id) = Worker::resolve_ip_to_host_id(std::net::IpAddr::V4(dst_ip)) else {
+        let Some(dst_host_id) = Worker::resolve_ip_to_host_id(dst_ip) else {
             log_once_per_value_at_level!(
                 dst_ip,
-                std::net::Ipv4Addr,
+                std::net::IpAddr,
                 log::Level::Warn,
                 log::Level::Debug,
                 "Packet has destination {dst_ip} which doesn't exist in the simulation. Dropping the packet.",
@@ -349,9 +349,6 @@ impl Worker {
             packetrc.add_status(PacketStatus::InetDropped);
             return;
         };
-
-        let src_ip = std::net::IpAddr::V4(src_ip);
-        let dst_ip = std::net::IpAddr::V4(dst_ip);
 
         // check if network reliability forces us to 'drop' the packet
         let reliability: f64 = Worker::with(|w| w.shared.reliability(src_ip, dst_ip).unwrap())

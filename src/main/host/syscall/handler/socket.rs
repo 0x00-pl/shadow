@@ -85,7 +85,7 @@ impl SyscallHandler {
                     }
 
                     if ctx.objs.host.params.use_new_tcp {
-                        Socket::Inet(InetSocket::Tcp(TcpSocket::new(file_flags)))
+                        Socket::Inet(InetSocket::Tcp(TcpSocket::new(file_flags, linux_api::socket::AddressFamily::AF_INET)))
                     } else {
                         Socket::Inet(InetSocket::LegacyTcp(LegacyTcpSocket::new(
                             file_flags,
@@ -104,6 +104,7 @@ impl SyscallHandler {
                         file_flags,
                         send_buf_size.try_into().unwrap(),
                         recv_buf_size.try_into().unwrap(),
+                        linux_api::socket::AddressFamily::AF_INET,
                     )))
                 }
                 _ => return Err(Errno::ESOCKTNOSUPPORT),

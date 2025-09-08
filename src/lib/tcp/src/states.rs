@@ -1,6 +1,6 @@
 use std::collections::{HashMap, LinkedList};
 use std::io::{Read, Write};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 use crate::buffer::RecvQueue;
 use crate::connection::Connection;
@@ -223,14 +223,14 @@ impl<X: Dependencies> Common<X> {
 pub(crate) struct RemoteLocalPair {
     /// The remote address (where a received packet was addressed from, or the address we're sending
     /// a packet to).
-    remote: SocketAddrV4,
+    remote: SocketAddr,
     /// The local address (where a received packet was addressed to, or the address we're sending a
     /// packet from).
-    local: SocketAddrV4,
+    local: SocketAddr,
 }
 
 impl RemoteLocalPair {
-    pub fn new(remote: SocketAddrV4, local: SocketAddrV4) -> Self {
+    pub fn new(remote: SocketAddr, local: SocketAddr) -> Self {
         Self { remote, local }
     }
 }
@@ -294,8 +294,8 @@ impl<X: Dependencies> TcpStateTrait<X> for InitState<X> {
 
     fn connect<T, E>(
         self,
-        remote_addr: SocketAddrV4,
-        associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        remote_addr: SocketAddr,
+        associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         let assoc_result = associate_fn();
 
@@ -338,7 +338,7 @@ impl<X: Dependencies> TcpStateTrait<X> for InitState<X> {
         false
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         None
     }
 }
@@ -567,8 +567,8 @@ impl<X: Dependencies> TcpStateTrait<X> for ListenState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::IsListening))
     }
@@ -731,7 +731,7 @@ impl<X: Dependencies> TcpStateTrait<X> for ListenState<X> {
         !self.send_buffer.is_empty() || !self.to_send.is_empty()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         None
     }
 }
@@ -805,8 +805,8 @@ impl<X: Dependencies> TcpStateTrait<X> for SynSentState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::InProgress))
     }
@@ -890,7 +890,7 @@ impl<X: Dependencies> TcpStateTrait<X> for SynSentState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -964,8 +964,8 @@ impl<X: Dependencies> TcpStateTrait<X> for SynReceivedState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::InProgress))
     }
@@ -1043,7 +1043,7 @@ impl<X: Dependencies> TcpStateTrait<X> for SynReceivedState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1095,8 +1095,8 @@ impl<X: Dependencies> TcpStateTrait<X> for EstablishedState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1190,7 +1190,7 @@ impl<X: Dependencies> TcpStateTrait<X> for EstablishedState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1231,8 +1231,8 @@ impl<X: Dependencies> TcpStateTrait<X> for FinWaitOneState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1333,7 +1333,7 @@ impl<X: Dependencies> TcpStateTrait<X> for FinWaitOneState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1374,8 +1374,8 @@ impl<X: Dependencies> TcpStateTrait<X> for FinWaitTwoState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1464,7 +1464,7 @@ impl<X: Dependencies> TcpStateTrait<X> for FinWaitTwoState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1505,8 +1505,8 @@ impl<X: Dependencies> TcpStateTrait<X> for ClosingState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1606,7 +1606,7 @@ impl<X: Dependencies> TcpStateTrait<X> for ClosingState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1662,8 +1662,8 @@ impl<X: Dependencies> TcpStateTrait<X> for TimeWaitState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1756,7 +1756,7 @@ impl<X: Dependencies> TcpStateTrait<X> for TimeWaitState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1808,8 +1808,8 @@ impl<X: Dependencies> TcpStateTrait<X> for CloseWaitState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -1906,7 +1906,7 @@ impl<X: Dependencies> TcpStateTrait<X> for CloseWaitState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -1947,8 +1947,8 @@ impl<X: Dependencies> TcpStateTrait<X> for LastAckState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         (self.into(), Err(ConnectError::AlreadyConnected))
     }
@@ -2048,7 +2048,7 @@ impl<X: Dependencies> TcpStateTrait<X> for LastAckState<X> {
         self.connection.wants_to_send()
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         Some((self.connection.local_addr, self.connection.remote_addr))
     }
 }
@@ -2093,8 +2093,8 @@ impl<X: Dependencies> TcpStateTrait<X> for RstState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         if self.was_connected {
             (self.into(), Err(ConnectError::AlreadyConnected))
@@ -2178,7 +2178,7 @@ impl<X: Dependencies> TcpStateTrait<X> for RstState<X> {
         true
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         None
     }
 }
@@ -2225,8 +2225,8 @@ impl<X: Dependencies> TcpStateTrait<X> for ClosedState<X> {
 
     fn connect<T, E>(
         self,
-        _remote_addr: SocketAddrV4,
-        _associate_fn: impl FnOnce() -> Result<(SocketAddrV4, T), E>,
+        _remote_addr: SocketAddr,
+        _associate_fn: impl FnOnce() -> Result<(SocketAddr, T), E>,
     ) -> (TcpStateEnum<X>, Result<T, ConnectError<E>>) {
         if self.was_connected {
             (self.into(), Err(ConnectError::AlreadyConnected))
@@ -2291,7 +2291,7 @@ impl<X: Dependencies> TcpStateTrait<X> for ClosedState<X> {
         false
     }
 
-    fn local_remote_addrs(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    fn local_remote_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
         None
     }
 }

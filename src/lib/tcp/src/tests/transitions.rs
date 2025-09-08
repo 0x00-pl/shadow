@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::tests::util::time::Duration;
 use crate::tests::{Errno, Host, Scheduler, TcpSocket, TestEnvState, establish_helper};
-use crate::{Ipv4Header, Payload, TcpConfig, TcpFlags, TcpHeader, TcpState};
+use crate::{IpHeader, Payload, TcpConfig, TcpFlags, TcpHeader, TcpState};
 
 #[test]
 fn test_close() {
@@ -57,7 +57,7 @@ fn test_accept() {
 
     // send the SYN
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -87,7 +87,7 @@ fn test_accept() {
 
     // send the ACK
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -131,7 +131,7 @@ fn test_accept_close_wait() {
 
     // send the SYN
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -155,7 +155,7 @@ fn test_accept_close_wait() {
 
     // send the ACK to move the child to the "established" state
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -175,7 +175,7 @@ fn test_accept_close_wait() {
 
     // send a FIN to move the child to the "close-wait" state
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: host.ip_addr,
         },
@@ -228,9 +228,9 @@ fn test_connect_active_open() {
 
     // send the SYN+ACK
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN | TcpFlags::ACK,
         src_port: 10,
@@ -276,9 +276,9 @@ fn test_connect_simultaneous_open() {
 
     // send a SYN
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::SYN,
         src_port: 10,
@@ -300,9 +300,9 @@ fn test_connect_simultaneous_open() {
 
     // send an ACK
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
-            dst: *tcp_bind_addr.ip(),
+            dst: tcp_bind_addr.ip(),
         },
         flags: TcpFlags::ACK,
         src_port: 10,
@@ -334,7 +334,7 @@ fn test_passive_close() {
 
     // send a FIN (move tcp to the "close-wait" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -373,7 +373,7 @@ fn test_passive_close() {
 
     // send an ACK (move tcp to the "closed" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -415,7 +415,7 @@ fn test_active_close_1() {
 
     // send a ACK (move tcp to the "fin-wait-two" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -435,7 +435,7 @@ fn test_active_close_1() {
 
     // send a FIN (move tcp to the "time-wait" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -489,7 +489,7 @@ fn test_active_close_2() {
 
     // send a FIN-ACK (move tcp to the "time-wait" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -543,7 +543,7 @@ fn test_active_close_3() {
 
     // send a FIN (move tcp to the "closing" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
@@ -567,7 +567,7 @@ fn test_active_close_3() {
 
     // send a ACK (move tcp to the "time-wait" state)
     let header = TcpHeader {
-        ip: Ipv4Header {
+        ip: IpHeader {
             src: "5.6.7.8".parse().unwrap(),
             dst: "1.2.3.4".parse().unwrap(),
         },
