@@ -5,22 +5,15 @@
 
 //! Tests for IPv6-related socket operations.
 //!
-//! Shadow does not yet implement IPv6 (see docs/limitations.md). This suite
-//! serves as a pre-provided test-driven-development marker for the future
-//! IPv6 implementation:
+//! Shadow supports IPv6, but not dual-stack sockets: a socket bound to `::`
+//! with `IPV6_V6ONLY=0` does not conflict with (or receive traffic for) IPv4
+//! addresses on the same port like it would on Linux.
+//! `test_dual_stack_bind_v6_connect_v4` is an intentional "not yet
+//! implemented" marker for that behavior.
 //!
-//! - Under native Linux (the "--libc-passing" environment) the full IPv6
-//!   socket API is exercised and must pass, validating the tests themselves
-//!   against real kernel behavior.
-//! - Under Shadow (no filter, run with "--summarize") *all* functionality
-//!   tests run and are expected to explicitly FAIL with EAFNOSUPPORT until
-//!   IPv6 support is implemented. These failures are intentional "todo"
-//!   markers. When implementing IPv6 support:
-//!   - make the functionality tests pass,
-//!   - update or remove `test_socket_af_inet6_eafnosupport` (it asserts the
-//!     current rejection behavior),
-//!   - check `test_bind_inet6_addr_on_inet_socket`, where Shadow's EINVAL
-//!     differs from Linux's EAFNOSUPPORT.
+//! Under native Linux (the "--libc-passing" environment) the full IPv6 socket
+//! API is exercised and must pass, validating the tests themselves against
+//! real kernel behavior.
 
 use std::thread;
 
@@ -79,14 +72,6 @@ fn get_tests() -> Vec<test_utils::ShadowTest<(), String>> {
         "test_socket_af_inet_control",
         test_socket_af_inet_control,
         set![TestEnv::Libc, TestEnv::Shadow],
-    )]);
-
-    // in Shadow, IPv6 is not yet implemented and socket(AF_INET6) must fail;
-    // this assertion must be updated/removed when IPv6 support is added
-    tests.extend(vec![test_utils::ShadowTest::new(
-        "test_socket_af_inet6_eafnosupport",
-        test_socket_af_inet6_eafnosupport,
-        set![TestEnv::Shadow],
     )]);
 
     // the full IPv6 socket API works on native Linux; under Shadow these
@@ -204,16 +189,6 @@ fn test_socket_af_inet_control() -> Result<(), String> {
             ));
         }
         unsafe { libc::close(rv) };
-    }
-    Ok(())
-}
-
-// Shadow does not support IPv6, and must reject the socket at creation time
-fn test_socket_af_inet6_eafnosupport() -> Result<(), String> {
-    for sock_type in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
-        let rv = unsafe { libc::socket(libc::AF_INET6, sock_type, 0) };
-        errno_is(rv, Some(libc::EAFNOSUPPORT))
-            .map_err(|e| format!("socket(AF_INET6, {sock_type}): {e}"))?;
     }
     Ok(())
 }

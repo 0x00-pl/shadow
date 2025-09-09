@@ -77,38 +77,46 @@ impl SyscallHandler {
                     &ctx.objs.host.abstract_unix_namespace(),
                 ))
             }
-            libc::AF_INET => match socket_type {
-                libc::SOCK_STREAM => {
-                    if protocol != 0 && protocol != libc::IPPROTO_TCP {
-                        log::debug!("Unsupported inet stream socket protocol {protocol}");
-                        return Err(Errno::EPROTONOSUPPORT);
-                    }
+            libc::AF_INET | libc::AF_INET6 => {
+                let domain = linux_api::socket::AddressFamily::from(domain as libc::sa_family_t);
 
-                    if ctx.objs.host.params.use_new_tcp {
-                        Socket::Inet(InetSocket::Tcp(TcpSocket::new(file_flags, linux_api::socket::AddressFamily::AF_INET)))
-                    } else {
-                        Socket::Inet(InetSocket::LegacyTcp(LegacyTcpSocket::new(
+                match socket_type {
+                    libc::SOCK_STREAM => {
+                        if protocol != 0 && protocol != libc::IPPROTO_TCP {
+                            log::debug!("Unsupported inet stream socket protocol {protocol}");
+                            return Err(Errno::EPROTONOSUPPORT);
+                        }
+
+                        // The legacy TCP stack does not support IPv6, so IPv6
+                        // sockets always use the new TCP stack.
+                        if domain == linux_api::socket::AddressFamily::AF_INET6
+                            || ctx.objs.host.params.use_new_tcp
+                        {
+                            Socket::Inet(InetSocket::Tcp(TcpSocket::new(file_flags, domain)))
+                        } else {
+                            Socket::Inet(InetSocket::LegacyTcp(LegacyTcpSocket::new(
+                                file_flags,
+                                ctx.objs.host,
+                            )))
+                        }
+                    }
+                    libc::SOCK_DGRAM => {
+                        if protocol != 0 && protocol != libc::IPPROTO_UDP {
+                            log::debug!("Unsupported inet dgram socket protocol {protocol}");
+                            return Err(Errno::EPROTONOSUPPORT);
+                        }
+                        let send_buf_size = ctx.objs.host.params.init_sock_send_buf_size;
+                        let recv_buf_size = ctx.objs.host.params.init_sock_recv_buf_size;
+                        Socket::Inet(InetSocket::Udp(UdpSocket::new(
                             file_flags,
-                            ctx.objs.host,
+                            send_buf_size.try_into().unwrap(),
+                            recv_buf_size.try_into().unwrap(),
+                            domain,
                         )))
                     }
+                    _ => return Err(Errno::ESOCKTNOSUPPORT),
                 }
-                libc::SOCK_DGRAM => {
-                    if protocol != 0 && protocol != libc::IPPROTO_UDP {
-                        log::debug!("Unsupported inet dgram socket protocol {protocol}");
-                        return Err(Errno::EPROTONOSUPPORT);
-                    }
-                    let send_buf_size = ctx.objs.host.params.init_sock_send_buf_size;
-                    let recv_buf_size = ctx.objs.host.params.init_sock_recv_buf_size;
-                    Socket::Inet(InetSocket::Udp(UdpSocket::new(
-                        file_flags,
-                        send_buf_size.try_into().unwrap(),
-                        recv_buf_size.try_into().unwrap(),
-                        linux_api::socket::AddressFamily::AF_INET,
-                    )))
-                }
-                _ => return Err(Errno::ESOCKTNOSUPPORT),
-            },
+            }
             libc::AF_NETLINK => {
                 let socket_type = match NetlinkSocketType::try_from(socket_type) {
                     Ok(x) => x,

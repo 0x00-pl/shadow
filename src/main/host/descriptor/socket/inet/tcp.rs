@@ -912,7 +912,7 @@ impl TcpSocket {
                 Ok(bytes_written as libc::socklen_t)
             }
             (libc::SOL_SOCKET, libc::SO_DOMAIN) => {
-                let domain = libc::AF_INET;
+                let domain: libc::c_int = u16::from(self.address_family()) as libc::c_int;
 
                 let optval_ptr = optval_ptr.cast::<libc::c_int>();
                 let bytes_written = write_partial(mem, &domain, optval_ptr, optlen as usize)?;

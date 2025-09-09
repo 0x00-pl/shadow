@@ -8,8 +8,7 @@ hosts:
     network_node_id: 0
     processes:
     - path: ../../target/debug/test_ipv6
-      # no --shadow-passing filter: all functionality tests run under shadow
-      # and are expected to fail until IPv6 is implemented; --summarize makes
-      # every failure visible instead of stopping at the first one
+      # no --shadow-passing filter: the dual-stack test is an intentional
+      # "not yet implemented" marker; --summarize reports all results
       args: --summarize
       start_time: 1
