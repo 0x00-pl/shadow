@@ -260,6 +260,76 @@ out:
         g_free(hosts);
 }
 
+// Looks for matching IPv6 addresses in /etc/hosts and adds them to the list
+// specified by `head` and `tail`.
+static void _getaddrinfo_add_matching_hosts_ipv6(struct addrinfo** head, struct addrinfo** tail,
+                                                 const char* node, bool add_tcp, bool add_udp,
+                                                 bool add_raw, in_port_t port) {
+    // TODO: Parse hosts file once and keep it in an efficiently-searchable
+    // in-memory format.
+    GError* error = NULL;
+    gchar* hosts = NULL;
+    char* pattern = NULL;
+    GMatchInfo* match_info = NULL;
+    GRegex* regex = NULL;
+
+    trace("Reading /etc/hosts file");
+
+    g_file_get_contents("/etc/hosts", &hosts, NULL, &error);
+    if (error != NULL) {
+        panic("Reading /etc/hosts: %s", error->message);
+        goto out;
+    }
+    assert(hosts != NULL);
+
+    {
+        gchar* escaped_node = g_regex_escape_string(node, -1);
+        // Build a regex to match an IPv6 address entry for the given `node`
+        // in /etc/hosts. See HOSTS(5) for format specification. IPv6 address
+        // strings consist of hex digits and colons, and may contain dots (for
+        // embedded IPv4 addresses).
+        int rv = asprintf(&pattern,
+                          "^([0-9a-fA-F:][0-9a-fA-F:.]*)[^#\n]*\\b%s\\b", escaped_node);
+        g_free(escaped_node);
+        if (rv < 0) {
+            panic("asprintf failed: %d", rv);
+            goto out;
+        }
+    }
+
+    regex = g_regex_new(pattern, G_REGEX_MULTILINE, 0, &error);
+    if (error != NULL) {
+        panic("g_regex_new: %s", error->message);
+        goto out;
+    }
+    assert(regex != NULL);
+
+    g_regex_match(regex, hosts, 0, &match_info);
+    // Like the IPv4 case above, only return the first matching address.
+    if (g_match_info_matches(match_info)) {
+        gchar* address_string = g_match_info_fetch(match_info, 1);
+        trace("Node:%s -> address string:%s", node, address_string);
+        assert(address_string != NULL);
+        struct in6_addr addr6;
+        int rv = inet_pton(AF_INET6, address_string, &addr6);
+        if (rv != 1) {
+            trace("Bad IPv6 address in /etc/hosts: %s\n", address_string);
+        } else {
+            _getaddrinfo_appendv6(head, tail, add_tcp, add_udp, add_raw, &addr6, port, 0);
+        }
+        g_free(address_string);
+    }
+out:
+    if (match_info != NULL)
+        g_match_info_free(match_info);
+    if (regex != NULL)
+        g_regex_unref(regex);
+    if (pattern != NULL)
+        free(pattern);
+    if (hosts != NULL)
+        g_free(hosts);
+}
+
 // Ask shadow to provide an ipv4 addr for a node using a custom syscall.
 // Returns true if we got a valid address from shadow, false otherwise.
 static bool _shim_api_hostname_to_addr_ipv4(const char* node, uint32_t* addr) {
@@ -352,9 +422,10 @@ int shimc_api_getaddrinfo(const char* node, const char* service, const struct ad
     // configured."
     //
     // Determining what kind of addresses the local system has configured is
-    // unimplemented. For now we assume it has IPv4 and not IPv6.
+    // unimplemented. Shadow configures both an IPv4 and an IPv6 address on
+    // each host, so we assume it has both.
     const bool system_has_an_ipv4_address = true;
-    const bool system_has_an_ipv6_address = false;
+    const bool system_has_an_ipv6_address = true;
 
     // "There are several reasons why the linked list may have more than one
     // addrinfo structure, including: the network host is ... accessible  over
@@ -394,7 +465,9 @@ int shimc_api_getaddrinfo(const char* node, const char* service, const struct ad
                     res, &tail, add_tcp, add_udp, add_raw, ntohl(INADDR_ANY), port);
             }
             if (add_ipv6) {
-                // TODO: IPv6
+                struct in6_addr any6;
+                memset(&any6, 0, sizeof(any6));
+                _getaddrinfo_appendv6(res, &tail, add_tcp, add_udp, add_raw, &any6, port, 0);
             }
         } else {
             // "If the AI_PASSIVE flag is not set in hints.ai_flags, then the
@@ -408,7 +481,9 @@ int shimc_api_getaddrinfo(const char* node, const char* service, const struct ad
                     res, &tail, add_tcp, add_udp, add_raw, ntohl(INADDR_LOOPBACK), port);
             }
             if (add_ipv6) {
-                // TODO: IPv6
+                struct in6_addr loopback6;
+                memcpy(&loopback6, &in6addr_loopback, sizeof(loopback6));
+                _getaddrinfo_appendv6(res, &tail, add_tcp, add_udp, add_raw, &loopback6, port, 0);
             }
         }
         // We've finished adding all relevant addresses.
@@ -467,7 +542,7 @@ int shimc_api_getaddrinfo(const char* node, const char* service, const struct ad
     // (and for now, only). For hosts lookups, the corresponding file is
     // /etc/hosts. See NSSWITCH.CONF(5).
     if (add_ipv6) {
-        // TODO: look for IPv6 addresses in /etc/hosts.
+        _getaddrinfo_add_matching_hosts_ipv6(res, &tail, node, add_tcp, add_udp, add_raw, port);
     }
     if (add_ipv4) {
         // Try first to avoid scanning the /etc/hosts file.

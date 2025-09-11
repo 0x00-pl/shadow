@@ -1,5 +1,5 @@
 use std::io::{Cursor, ErrorKind, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Weak};
 
 use atomic_refcell::AtomicRefCell;
@@ -58,12 +58,15 @@ impl NetlinkSocket {
 
             // Get the IP address of the host
             let default_ip = Worker::with_active_host(|host| host.default_ip()).unwrap();
+            let default_ip6 = Worker::with_active_host(|host| host.default_ip6()).unwrap();
             // All the interface configurations are the same as in the getifaddrs function handler
             let interfaces = vec![
                 Interface {
                     address: Ipv4Addr::LOCALHOST,
+                    address6: Some(Ipv6Addr::LOCALHOST),
                     label: String::from("lo"),
                     prefix_len: 8,
+                    prefix_len6: 128,
                     if_type: Arphrd::Loopback,
                     mtu: c::CONFIG_MTU,
                     scope: RtScope::Host,
@@ -71,8 +74,10 @@ impl NetlinkSocket {
                 },
                 Interface {
                     address: default_ip,
+                    address6: Some(default_ip6),
                     label: String::from("eth0"),
                     prefix_len: 24,
+                    prefix_len6: 64,
                     if_type: Arphrd::Ether,
                     mtu: c::CONFIG_MTU,
                     scope: RtScope::Universe,
@@ -804,11 +809,12 @@ impl InitialState {
             return self.handle_error(bytes);
         };
 
-        // The only supported interface address family is AF_INET
+        // The supported interface address families are AF_INET and AF_INET6
         if *ifaddrmsg.ifa_family() != RtAddrFamily::Unspecified
             && *ifaddrmsg.ifa_family() != RtAddrFamily::Inet
+            && *ifaddrmsg.ifa_family() != RtAddrFamily::Inet6
         {
-            log::warn!("Unsupported ifa_family (only AF_UNSPEC and AF_INET are supported)");
+            log::warn!("Unsupported ifa_family (only AF_UNSPEC, AF_INET, and AF_INET6 are supported)");
             return self.handle_error(bytes);
         }
 
@@ -824,9 +830,63 @@ impl InitialState {
             return self.handle_error(bytes);
         }
 
+        let requested_family = *ifaddrmsg.ifa_family();
+
         let mut buffer = Cursor::new(Vec::new());
         // Send the interface addresses
         for interface in &common.interfaces {
+            // emit the IPv6 address if it was requested (or for AF_UNSPEC)
+            if requested_family == RtAddrFamily::Unspecified
+                || requested_family == RtAddrFamily::Inet6
+            {
+                if let Some(address6) = interface.address6 {
+                    let address = address6.octets();
+                    let mut label = Vec::from(interface.label.as_bytes());
+                    label.push(0); // Null-terminate
+
+                    let attrs = [
+                        RtattrBuilder::default()
+                            .rta_type(Ifa::Address)
+                            .rta_payload(Buffer::from(&address[..]))
+                            .build()
+                            .unwrap(),
+                        RtattrBuilder::default()
+                            .rta_type(Ifa::Local)
+                            .rta_payload(Buffer::from(&address[..]))
+                            .build()
+                            .unwrap(),
+                        RtattrBuilder::default()
+                            .rta_type(Ifa::Label)
+                            .rta_payload(Buffer::from(label))
+                            .build()
+                            .unwrap(),
+                    ];
+                    let ifaddrmsg = IfaddrmsgBuilder::default()
+                        .ifa_family(RtAddrFamily::Inet6)
+                        .ifa_prefixlen(interface.prefix_len6)
+                        // IFA_F_PERMANENT is used to indicate that the address is permanent
+                        .ifa_flags(IfaF::PERMANENT)
+                        .ifa_scope(interface.scope)
+                        .ifa_index(interface.index)
+                        .rtattrs(RtBuffer::from_iter(attrs))
+                        .build()
+                        .expect("IfaddrmsgBuilder missing a required field");
+                    let nlmsg = NlmsghdrBuilder::default()
+                        .nl_type(Rtm::Newaddr)
+                        .nl_flags(NlmF::MULTI)
+                        .nl_seq(*nlmsg.nl_seq())
+                        .nl_payload(NlPayload::Payload(ifaddrmsg))
+                        .build()
+                        .expect("NlmsghdrBuilder missing a required field");
+                    nlmsg.to_bytes(&mut buffer).unwrap();
+                }
+            }
+
+            // skip the IPv4 address if only IPv6 was requested
+            if requested_family == RtAddrFamily::Inet6 {
+                continue;
+            }
+
             let address = interface.address.octets();
             let broadcast = Ipv4Addr::from(
                 0xffff_ffff_u32
@@ -918,6 +978,7 @@ impl InitialState {
         // The only supported interface address family is AF_INET
         if *ifinfomsg.ifi_family() != RtAddrFamily::Unspecified
             && *ifinfomsg.ifi_family() != RtAddrFamily::Inet
+            && *ifinfomsg.ifi_family() != RtAddrFamily::Inet6
         {
             warn_once_then_debug!(
                 "Unsupported ifi_family (only AF_UNSPEC and AF_INET are supported)"
@@ -1089,6 +1150,10 @@ impl ClosedState {
 // The struct used to describe the network interface
 struct Interface {
     address: Ipv4Addr,
+    /// The interface's IPv6 address, if any.
+    address6: Option<Ipv6Addr>,
+    /// The IPv6 address prefix length.
+    prefix_len6: u8,
     label: String,
     prefix_len: u8,
     if_type: Arphrd,

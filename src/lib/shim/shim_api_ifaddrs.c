@@ -27,7 +27,8 @@ int shimc_api_getifaddrs(struct ifaddrs** ifap) {
     }
 
     /* we always have loopback */
-    struct ifaddrs* i = calloc(1, sizeof(struct ifaddrs));
+    struct ifaddrs* head = calloc(1, sizeof(struct ifaddrs));
+    struct ifaddrs* i = head;
     i->ifa_flags = (IFF_UP | IFF_RUNNING | IFF_LOOPBACK);
     i->ifa_name = strdup("lo");
 
@@ -53,6 +54,35 @@ int shimc_api_getifaddrs(struct ifaddrs** ifap) {
 
     ((struct sockaddr_in*)i->ifa_netmask)->sin_addr = addr_buf;
 
+    /* also advertise the IPv6 loopback address */
+    {
+        struct ifaddrs* lo6 = calloc(1, sizeof(struct ifaddrs));
+        lo6->ifa_flags = (IFF_UP | IFF_RUNNING | IFF_LOOPBACK);
+        lo6->ifa_name = strdup("lo");
+
+        lo6->ifa_addr = calloc(1, sizeof(struct sockaddr_in6));
+        lo6->ifa_addr->sa_family = AF_INET6;
+        lo6->ifa_netmask = calloc(1, sizeof(struct sockaddr_in6));
+        lo6->ifa_netmask->sa_family = AF_INET6;
+
+        struct in6_addr addr6_buf;
+        struct in6_addr netmask6_128;
+        if (inet_pton(AF_INET6, "::1", &addr6_buf) != 1 ||
+            inet_pton(AF_INET6, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", &netmask6_128) != 1) {
+            shimc_api_freeifaddrs(lo6);
+            shimc_api_freeifaddrs(i);
+            errno = EADDRNOTAVAIL;
+            return -1;
+        }
+
+        ((struct sockaddr_in6*)lo6->ifa_addr)->sin6_addr = addr6_buf;
+        ((struct sockaddr_in6*)lo6->ifa_netmask)->sin6_addr = netmask6_128;
+
+        i->ifa_next = lo6;
+        /* subsequent entries are appended to lo6 */
+        i = lo6;
+    }
+
     /* a /24 netmask */
     struct in_addr netmask_24;
     if (inet_pton(AF_INET, "255.255.255.0", &netmask_24) != 1) {
@@ -64,6 +94,12 @@ int shimc_api_getifaddrs(struct ifaddrs** ifap) {
     /* get the hostname so we can use it to lookup the default net address */
     char hostname_buf[HOST_NAME_MAX] = {};
     if (gethostname(hostname_buf, HOST_NAME_MAX) == 0) {
+        /* find the tail of the list */
+        struct ifaddrs* tail = head;
+        while (tail->ifa_next != NULL) {
+            tail = tail->ifa_next;
+        }
+
         struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
         struct addrinfo* host_ai;
 
@@ -82,13 +118,39 @@ int shimc_api_getifaddrs(struct ifaddrs** ifap) {
             j->ifa_netmask->sa_family = AF_INET;
             ((struct sockaddr_in*)j->ifa_netmask)->sin_addr = netmask_24;
 
-            i->ifa_next = j;
+            tail->ifa_next = j;
+            tail = j;
 
             freeaddrinfo(host_ai);
         }
+
+        /* also advertise the host's IPv6 address */
+        struct addrinfo hints6 = {.ai_family = AF_INET6, .ai_socktype = SOCK_STREAM};
+        struct addrinfo* host_ai6;
+
+        if (getaddrinfo(hostname_buf, NULL, &hints6, &host_ai6) == 0) {
+            struct ifaddrs* j = calloc(1, sizeof(struct ifaddrs));
+            j->ifa_flags = (IFF_UP | IFF_RUNNING);
+            j->ifa_name = strdup("eth0");
+
+            j->ifa_addr = calloc(1, sizeof(struct sockaddr));
+            memcpy(j->ifa_addr, host_ai6->ai_addr, (unsigned long)host_ai6->ai_addrlen);
+
+            /* assign it a /64 netmask */
+            j->ifa_netmask = calloc(1, sizeof(struct sockaddr));
+            j->ifa_netmask->sa_family = AF_INET6;
+            struct in6_addr netmask6_64;
+            if (inet_pton(AF_INET6, "ffff:ffff:ffff:ffff::", &netmask6_64) == 1) {
+                ((struct sockaddr_in6*)j->ifa_netmask)->sin6_addr = netmask6_64;
+            }
+
+            tail->ifa_next = j;
+
+            freeaddrinfo(host_ai6);
+        }
     }
 
-    *ifap = i;
+    *ifap = head;
     return 0;
 }
 

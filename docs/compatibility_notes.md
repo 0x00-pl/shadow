@@ -167,9 +167,9 @@ rm -rf shadow.data; shadow shadow.yaml > shadow.log
 
 ### Notes
 
-1. By default iPerf 3 servers bind to an IPv6 address, but [Shadow doesn't
-support IPv6](limitations.md#ipv6). Instead you need to bind the server to an IPv4 address such as
-0.0.0.0.
+1. By default iPerf 3 servers bind to an IPv6 address. [Shadow supports
+IPv6](limitations.md#ipv6), but if you have problems with the default binding you can
+bind the server to an IPv4 address such as 0.0.0.0.
 
 2. The iPerf 3 server exits with a non-zero error code and the message "unable
 to start listener for connections: Address already in use" after the client

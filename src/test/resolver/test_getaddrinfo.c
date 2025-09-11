@@ -369,13 +369,8 @@ void test_ipv6() {
 
     int rv = getaddrinfo(NULL, "80", &hints, &res);
 
-    if (running_in_shadow()) {
-        // shadow doesn't support IPv6
-        assert_getaddrinfo_rv_equals(rv, EAI_NONAME);
-    } else {
-        // linux should return a non-error result
-        assert_getaddrinfo_rv_equals(rv, 0);
-    }
+    // shadow and linux should both return a non-error result
+    assert_getaddrinfo_rv_equals(rv, 0);
 }
 
 int main(int argc, char* argv[]) {

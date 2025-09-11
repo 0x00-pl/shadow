@@ -37,8 +37,19 @@ doesn't work as expected.
 
 ## IPv6
 
-Shadow does not yet implement IPv6. Most applications can be configured to use IPv4
-instead. Tracking issue: [#2216](https://github.com/shadow/shadow/issues/2216]).
+Shadow supports IPv6 sockets and applications may use IPv6 addresses. Each host
+is assigned both an IPv4 and an IPv6 address, and `socket(AF_INET6, ...)`,
+`getaddrinfo()`, `getifaddrs()`, and netlink address queries return IPv6
+addresses.
+
+Known limitations:
+
+- Dual-stack sockets are not fully implemented: an IPv6 socket with
+  `IPV6_V6ONLY` disabled does not accept IPv4 traffic (using IPv4-mapped
+  addresses) as it would on Linux, and does not conflict with IPv4 binds on the
+  same port.
+- The legacy (C) TCP stack does not support IPv6; IPv6 TCP sockets always use
+  the new Rust TCP stack, even when `use_new_tcp` is disabled.
 
 ## Statically linked executables
 
