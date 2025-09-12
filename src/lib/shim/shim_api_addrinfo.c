@@ -370,6 +370,43 @@ static bool _shim_api_hostname_to_addr_ipv4(const char* node, uint32_t* addr) {
     }
 }
 
+// Ask shadow to provide an ipv6 addr for a node using a custom syscall.
+// Returns true if we got a valid address from shadow, false otherwise.
+static bool _shim_api_hostname_to_addr_ipv6(const char* node, struct in6_addr* addr) {
+    if (!node || !addr) {
+        return false;
+    }
+
+    // Skip the Shadow syscall for localhost lookups.
+    if (strcasecmp(node, "localhost") == 0) {
+        memcpy(addr, &in6addr_loopback, sizeof(*addr));
+        trace("handled localhost getaddrinfo() lookup locally");
+        return true;
+    }
+
+    // Resolve the hostname (find the ipv6 `addr` associated with hostname `name`) using a custom
+    // syscall that Shadow handles internally.
+    trace("Performing custom shadow syscall SYS_shadow_hostname_to_addr_ipv6 for name %s", node);
+    int rv = shim_api_syscall(
+        SHADOW_SYSCALL_NUM_HOSTNAME_TO_ADDR_IPV6, node, strlen(node), addr, sizeof(*addr));
+
+    if (rv == 0) {
+#ifdef DEBUG
+        char addr_str_buf[INET6_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET6, addr, addr_str_buf, INET6_ADDRSTRLEN)) {
+            trace("SYS_shadow_hostname_to_addr_ipv6 returned addr %s for name %s", addr_str_buf,
+                  node);
+        } else {
+            trace("SYS_shadow_hostname_to_addr_ipv6 succeeded for name %s", node);
+        }
+#endif
+        return true;
+    } else {
+        trace("SYS_shadow_hostname_to_addr_ipv6 failed for name %s", node);
+        return false;
+    }
+}
+
 int shimc_api_getaddrinfo(const char* node, const char* service, const struct addrinfo* hints,
                           struct addrinfo** res) {
     // Quoted text is from the man page.
@@ -542,7 +579,15 @@ int shimc_api_getaddrinfo(const char* node, const char* service, const struct ad
     // (and for now, only). For hosts lookups, the corresponding file is
     // /etc/hosts. See NSSWITCH.CONF(5).
     if (add_ipv6) {
-        _getaddrinfo_add_matching_hosts_ipv6(res, &tail, node, add_tcp, add_udp, add_raw, port);
+        // Try first to avoid scanning the /etc/hosts file. The hosts file that
+        // the shim can read may not be the one provided by shadow.
+        struct in6_addr addr6;
+        if (_shim_api_hostname_to_addr_ipv6(node, &addr6)) {
+            _getaddrinfo_appendv6(res, &tail, add_tcp, add_udp, add_raw, &addr6, port, 0);
+        } else {
+            // Fall back to scanning /etc/hosts.
+            _getaddrinfo_add_matching_hosts_ipv6(res, &tail, node, add_tcp, add_udp, add_raw, port);
+        }
     }
     if (add_ipv4) {
         // Try first to avoid scanning the /etc/hosts file.

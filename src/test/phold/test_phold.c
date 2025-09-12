@@ -167,7 +167,17 @@ __attribute__((unused)) static in_addr_t _phold_lookupIP(PHold* phold, const gch
     gint result = getaddrinfo((gchar*) hostname, NULL, NULL, &info);
 
     if (result == 0) {
-        ip = ((struct sockaddr_in*) (info->ai_addr))->sin_addr.s_addr;
+        // find the IPv4 result, since the results may also include IPv6
+        // addresses when the host has both (as in shadow)
+        struct addrinfo* iter = info;
+        while (iter != NULL && iter->ai_family != AF_INET) {
+            iter = iter->ai_next;
+        }
+        if (iter != NULL) {
+            ip = ((struct sockaddr_in*) (iter->ai_addr))->sin_addr.s_addr;
+        } else {
+            phold_error("getaddrinfo(): no IPv4 result for host '%s'", hostname);
+        }
     } else {
         phold_error("getaddrinfo(): returned %i host '%s' errno %i: %s",
                 result, hostname, errno, g_strerror(errno));

@@ -42,6 +42,10 @@ pub struct TcpSocket {
     shutdown_status: Option<Shutdown>,
     /// The socket's address family, as given at socket creation time.
     domain: linux_api::socket::AddressFamily,
+    /// The values of the `SO_RCVTIMEO`/`SO_SNDTIMEO` socket options. Stored
+    /// for `getsockopt()`, but not currently enforced.
+    recv_timeout: std::time::Duration,
+    send_timeout: std::time::Duration,
     // should only be used by `OpenFile` to make sure there is only ever one `OpenFile` instance for
     // this file
     has_open_file: bool,
@@ -70,6 +74,8 @@ impl TcpSocket {
                 connect_result_is_pending: false,
                 shutdown_status: None,
                 domain,
+                recv_timeout: std::time::Duration::ZERO,
+                send_timeout: std::time::Duration::ZERO,
                 has_open_file: false,
                 _counter: ObjectCounter::new("TcpSocket"),
             })
@@ -804,6 +810,8 @@ impl TcpSocket {
                 connect_result_is_pending: false,
                 shutdown_status: None,
                 domain: self.address_family(),
+                recv_timeout: self.recv_timeout,
+                send_timeout: self.send_timeout,
                 has_open_file: false,
                 _counter: ObjectCounter::new("TcpSocket"),
             })
@@ -951,6 +959,21 @@ impl TcpSocket {
 
                 Ok(bytes_written as libc::socklen_t)
             }
+            (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
+                let timeout = match (level, optname) {
+                    (libc::SOL_SOCKET, libc::SO_RCVTIMEO) => self.recv_timeout,
+                    _ => self.send_timeout,
+                };
+                let tv = libc::timeval {
+                    tv_sec: (timeout.as_secs_f64()) as libc::time_t,
+                    tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+                };
+
+                let optval_ptr = optval_ptr.cast::<libc::timeval>();
+                let bytes_written = write_partial(mem, &tv, optval_ptr, optlen as usize)?;
+
+                Ok(bytes_written as libc::socklen_t)
+            }
             _ => {
                 log_once_per_value_at_level!(
                     (level, optname),
@@ -984,6 +1007,30 @@ impl TcpSocket {
             (libc::SOL_SOCKET, libc::SO_KEEPALIVE) => {
                 // TODO: implement this, libevent uses it in evconnlistener_new_bind()
                 log::trace!("setsockopt SO_KEEPALIVE not yet implemented");
+            }
+            (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
+                type OptType = libc::timeval;
+
+                if usize::try_from(optlen).unwrap() < std::mem::size_of::<OptType>() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                let optval_ptr = optval_ptr.cast::<OptType>();
+                let tv: libc::timeval = mem.read(optval_ptr)?;
+
+                if tv.tv_sec != 0 || tv.tv_usec != 0 {
+                    warn_once_then_debug!(
+                        "TCP socket send/receive timeouts are not yet enforced by shadow"
+                    );
+                }
+
+                let timeout = std::time::Duration::from_micros(
+                    (tv.tv_sec * 1_000_000 + tv.tv_usec as i64) as u64,
+                );
+                match (level, optname) {
+                    (libc::SOL_SOCKET, libc::SO_RCVTIMEO) => self.recv_timeout = timeout,
+                    _ => self.send_timeout = timeout,
+                }
             }
             (libc::SOL_SOCKET, libc::SO_BROADCAST) => {
                 type OptType = libc::c_int;

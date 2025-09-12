@@ -50,6 +50,10 @@ pub struct UdpSocket {
     /// The value of the `IPV6_V6ONLY` socket option. Only meaningful for
     /// IPv6 sockets.
     ipv6_only: bool,
+    /// The values of the `SO_RCVTIMEO`/`SO_SNDTIMEO` socket options. Stored
+    /// for `getsockopt()`, but not currently enforced.
+    recv_timeout: std::time::Duration,
+    send_timeout: std::time::Duration,
     /// The receive time of the last packet returned to the managed process during a call to
     /// `recvmsg()`. Used for `SIOCGSTAMP`.
     recv_time_of_last_read_packet: Option<EmulatedTime>,
@@ -78,6 +82,8 @@ impl UdpSocket {
             association: None,
             domain,
             ipv6_only: false,
+            recv_timeout: std::time::Duration::ZERO,
+            send_timeout: std::time::Duration::ZERO,
             recv_time_of_last_read_packet: None,
             has_open_file: false,
             _counter: ObjectCounter::new("UdpSocket"),
@@ -916,6 +922,22 @@ impl UdpSocket {
 
                 Ok(bytes_written as libc::socklen_t)
             }
+            (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
+                let timeout = match (level, optname) {
+                    (libc::SOL_SOCKET, libc::SO_RCVTIMEO) => self.recv_timeout,
+                    _ => self.send_timeout,
+                };
+                // convert from internal microseconds to a struct timeval
+                let tv = libc::timeval {
+                    tv_sec: (timeout.as_secs_f64()) as libc::time_t,
+                    tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+                };
+
+                let optval_ptr = optval_ptr.cast::<libc::timeval>();
+                let bytes_written = write_partial(mem, &tv, optval_ptr, optlen as usize)?;
+
+                Ok(bytes_written as libc::socklen_t)
+            }
             (libc::SOL_SOCKET, _) => {
                 log_once_per_value_at_level!(
                     (level, optname),
@@ -1032,6 +1054,30 @@ impl UdpSocket {
                     warn_once_then_debug!(
                         "setsockopt SO_BROADCAST not yet implemented for udp; ignoring and returning 0"
                     );
+                }
+            }
+            (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
+                type OptType = libc::timeval;
+
+                if usize::try_from(optlen).unwrap() < std::mem::size_of::<OptType>() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                let optval_ptr = optval_ptr.cast::<OptType>();
+                let tv: libc::timeval = mem.read(optval_ptr)?;
+
+                let timeout =
+                    std::time::Duration::from_micros((tv.tv_sec * 1_000_000 + tv.tv_usec as i64) as u64);
+
+                if tv.tv_sec != 0 || tv.tv_usec != 0 {
+                    warn_once_then_debug!(
+                        "UDP socket send/receive timeouts are not yet enforced by shadow"
+                    );
+                }
+
+                match (level, optname) {
+                    (libc::SOL_SOCKET, libc::SO_RCVTIMEO) => self.recv_timeout = timeout,
+                    _ => self.send_timeout = timeout,
                 }
             }
             (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) => {

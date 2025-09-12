@@ -107,4 +107,73 @@ impl SyscallHandler {
 
         Ok(())
     }
+
+    log_syscall!(
+        shadow_hostname_to_addr_ipv6,
+        /* rv */ std::ffi::c_int,
+        /* name_ptr */ SyscallBufferArg</* name_len */ 1>,
+        /* name_len */ u64,
+        /* addr_ptr */ SyscallSockAddrArg</* addr_len */ 4>,
+        /* addr_len */ u64,
+    );
+    pub fn shadow_hostname_to_addr_ipv6(
+        ctx: &mut SyscallContext,
+        name_ptr: ForeignPtr<std::ffi::c_char>,
+        name_len: u64,
+        addr_ptr: ForeignPtr<()>,
+        addr_len: u64,
+    ) -> Result<(), Errno> {
+        log::trace!("Handling custom syscall shadow_hostname_to_addr_ipv6");
+
+        let name_len: usize = name_len.try_into().unwrap();
+        let addr_len: usize = addr_len.try_into().unwrap();
+
+        if addr_len < std::mem::size_of::<[u8; 16]>() {
+            log::trace!("Invalid addr_len {addr_len}, returning EINVAL");
+            return Err(Errno::EINVAL);
+        }
+
+        let name_ptr = name_ptr.cast::<u8>();
+        // add one byte to the length and hope that it contains a NUL
+        let name_ptr = ForeignArrayPtr::new(name_ptr, name_len + 1);
+        let addr_ptr = addr_ptr.cast::<[u8; 16]>();
+
+        let mut mem = ctx.objs.process.memory_borrow_mut();
+
+        let lookup_name_ref = mem.memory_ref_prefix(name_ptr)?;
+        let lookup_name = lookup_name_ref.get_cstr()?;
+        let lookup_name_bytes = lookup_name.to_bytes();
+
+        if case_insensitive_eq(lookup_name_bytes, &b"localhost"[..]) {
+            mem.write(addr_ptr, &std::net::Ipv6Addr::LOCALHOST.octets())?;
+            log::trace!("Returning loopback address for localhost");
+            return Ok(());
+        }
+
+        let max_len = libc::NI_MAXHOST.try_into().unwrap();
+        let host_name = ctx.objs.host.info().name.as_bytes();
+        let host_name = &host_name[..std::cmp::min(host_name.len(), max_len)];
+        let lookup_name_bytes =
+            &lookup_name_bytes[..std::cmp::min(lookup_name_bytes.len(), max_len)];
+
+        let addr = if case_insensitive_eq(lookup_name_bytes, host_name) {
+            log::trace!("Using default address for my own hostname {lookup_name:?}");
+            Some(ctx.objs.host.default_ip6())
+        } else {
+            log::trace!("Looking up name {lookup_name:?}");
+            Worker::resolve_name_to_ip6(lookup_name)
+        };
+
+        let Some(addr) = addr else {
+            log::trace!("Unable to find address for name {lookup_name:?}");
+            // return EFAULT like gethostname
+            return Err(Errno::EFAULT);
+        };
+
+        log::trace!("Found address {addr} for name {lookup_name:?}");
+
+        mem.write(addr_ptr, &addr.octets())?;
+
+        Ok(())
+    }
 }

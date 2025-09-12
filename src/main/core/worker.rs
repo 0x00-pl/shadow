@@ -482,6 +482,14 @@ impl Worker {
         }
     }
 
+    pub fn resolve_name_to_ip6(name: &std::ffi::CStr) -> Option<std::net::Ipv6Addr> {
+        if let Ok(name) = name.to_str() {
+            Worker::with_dns(|dns| dns.name_to_addr_v6(name))
+        } else {
+            None
+        }
+    }
+
     pub fn resolve_ip_to_host_id(ip: std::net::IpAddr) -> Option<HostId> {
         Worker::with_dns(|dns| dns.addr_to_host_id(ip))
     }

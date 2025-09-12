@@ -524,6 +524,9 @@ impl SyscallHandler {
                     ShadowSyscallNum::hostname_to_addr_ipv4 => {
                         handle!(shadow_hostname_to_addr_ipv4)
                     }
+                    ShadowSyscallNum::hostname_to_addr_ipv6 => {
+                        handle!(shadow_hostname_to_addr_ipv6)
+                    }
                     ShadowSyscallNum::init_memory_manager => {
                         handle!(shadow_init_memory_manager)
                     }

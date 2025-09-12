@@ -19,6 +19,7 @@ pub enum ShadowSyscallNum {
     // Deprecated: SYS_shadow_get_shm_blk = 1002,
     hostname_to_addr_ipv4 = 1003,
     init_memory_manager = 1004,
+    hostname_to_addr_ipv6 = 1006,
     // Conceptually similar to SYS_sched_yield, but made by the shim to return
     // control to Shadow. For now, using a different syscall here is mostly for
     // debugging purposes, so that it doesn't appear that the managed code

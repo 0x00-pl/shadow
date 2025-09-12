@@ -133,7 +133,7 @@ int shimc_api_getifaddrs(struct ifaddrs** ifap) {
             j->ifa_flags = (IFF_UP | IFF_RUNNING);
             j->ifa_name = strdup("eth0");
 
-            j->ifa_addr = calloc(1, sizeof(struct sockaddr));
+            j->ifa_addr = calloc(1, sizeof(struct sockaddr_in6));
             memcpy(j->ifa_addr, host_ai6->ai_addr, (unsigned long)host_ai6->ai_addrlen);
 
             /* assign it a /64 netmask */

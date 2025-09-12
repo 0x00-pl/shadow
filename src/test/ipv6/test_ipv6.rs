@@ -27,8 +27,27 @@ const PORT_BIND_ANY: u16 = 22102;
 const PORT_BIND_EADDRINUSE: u16 = 22103;
 const PORT_TCP_LOOPBACK: u16 = 22105;
 const PORT_DUAL_STACK: u16 = 22106;
+const PORT_TCP_REFUSED: u16 = 22107;
+const PORT_UDP_SENDMSG: u16 = 22108;
+const PORT_DNS: u16 = 22109;
 
 fn main() -> Result<(), String> {
+    // two-host simulation tests run this binary with a role argument; the
+    // client and server run as separate managed processes on separate hosts
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(role) = args
+        .iter()
+        .find(|x| matches!(x.as_str(), "udp-server" | "udp-client" | "tcp-server" | "tcp-client"))
+    {
+        let port: u16 = args
+            .iter()
+            .position(|x| x == role)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|x| x.parse().ok())
+            .ok_or_else(|| format!("missing port argument for role {role}"))?;
+        return run_role(role, port);
+    }
+
     // should we restrict the tests we run?
     let filter_shadow_passing = std::env::args().any(|x| x == "--shadow-passing");
     let filter_libc_passing = std::env::args().any(|x| x == "--libc-passing");
@@ -128,9 +147,137 @@ fn get_tests() -> Vec<test_utils::ShadowTest<(), String>> {
             test_dual_stack_bind_v6_connect_v4,
             set![TestEnv::Libc, TestEnv::Shadow],
         ),
+        test_utils::ShadowTest::new(
+            "test_tcp_connect_refused_v6",
+            test_tcp_connect_refused_v6,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_udp_sendmsg_recvmsg_v6",
+            test_udp_sendmsg_recvmsg_v6,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_getaddrinfo_localhost_v6",
+            test_getaddrinfo_localhost_v6,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
     ]);
 
     tests
+}
+
+/// Runs one side of a two-host simulation test. The client and server run as
+/// separate managed processes on separate hosts, exercising cross-host IPv6
+/// packet forwarding, DNS resolution via `getaddrinfo()`, and explicit IPv6
+/// addresses from the simulation config.
+fn run_role(role: &str, port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+
+    const PAYLOAD: &[u8] = b"ipv6 two-host test payload";
+    const TIMEOUT: Duration = Duration::from_secs(8);
+
+    // resolves the "server" hostname to an IPv6 address using getaddrinfo()
+    let resolve_server_v6 = || -> Result<SocketAddr, String> {
+        ("server", port)
+            .to_socket_addrs()
+            .map_err(|e| format!("getaddrinfo(server): {e}"))?
+            .find(|a| a.is_ipv6())
+            .ok_or_else(|| "getaddrinfo(server) returned no IPv6 address".to_string())
+    };
+
+    match role {
+        "udp-server" => {
+            let sock = UdpSocket::bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
+                .map_err(|e| format!("bind: {e}"))?;
+            sock.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+
+            let mut buf = [0u8; 256];
+            let (n, peer) = sock
+                .recv_from(&mut buf)
+                .map_err(|e| format!("recv_from: {e}"))?;
+            if &buf[..n] != PAYLOAD {
+                return Err(format!("unexpected payload {:#?}", &buf[..n]));
+            }
+
+            sock.send_to(&buf[..n], peer)
+                .map_err(|e| format!("send_to: {e}"))?;
+            println!("udp-server: ok (peer {peer})");
+            Ok(())
+        }
+        "udp-client" => {
+            let addr = resolve_server_v6()?;
+
+            let sock = UdpSocket::bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0))
+                .map_err(|e| format!("bind: {e}"))?;
+            sock.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+
+            sock.send_to(PAYLOAD, addr)
+                .map_err(|e| format!("send_to: {e}"))?;
+
+            let mut buf = [0u8; 256];
+            let (n, src) = sock
+                .recv_from(&mut buf)
+                .map_err(|e| format!("recv_from: {e}"))?;
+            if src != addr {
+                return Err(format!("reply from {src}, expected {addr}"));
+            }
+            if &buf[..n] != PAYLOAD {
+                return Err(format!("unexpected reply payload {:#?}", &buf[..n]));
+            }
+            println!("udp-client: ok ({addr})");
+            Ok(())
+        }
+        "tcp-server" => {
+            let listener = TcpListener::bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
+                .map_err(|e| format!("bind: {e}"))?;
+
+            let (mut stream, peer) = listener
+                .accept()
+                .map_err(|e| format!("accept: {e}"))?;
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .map_err(|e| e.to_string())?;
+
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+            if &buf[..n] != PAYLOAD {
+                return Err(format!("unexpected payload {:#?}", &buf[..n]));
+            }
+
+            stream.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+            println!("tcp-server: ok (peer {peer})");
+            Ok(())
+        }
+        "tcp-client" => {
+            let addr = resolve_server_v6()?;
+
+            let mut stream =
+                TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .map_err(|e| e.to_string())?;
+
+            stream.write_all(PAYLOAD).map_err(|e| format!("write: {e}"))?;
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .map_err(|e| format!("shutdown: {e}"))?;
+
+            let mut buf = Vec::new();
+            stream
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read: {e}"))?;
+            if buf != PAYLOAD {
+                return Err(format!("unexpected echo payload {:#?}", &buf[..]));
+            }
+            println!("tcp-client: ok ({addr})");
+            Ok(())
+        }
+        _ => unreachable!(),
+    }
 }
 
 // build a sockaddr_in6 for the given ipv6 address and (host-order) port
@@ -737,4 +884,122 @@ fn test_dual_stack_bind_v6_connect_v4() -> Result<(), String> {
         errno_is(rv, Some(libc::EADDRINUSE))
             .map_err(|e| format!("bind(0.0.0.0:{PORT_DUAL_STACK}) while :: is bound: {e}"))
     })
+}
+
+// a TCP connect to a loopback port with no listener must be refused
+fn test_tcp_connect_refused_v6() -> Result<(), String> {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "socket(AF_INET6, SOCK_STREAM): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let addr = sockaddr_in6(ipv6_loopback(), PORT_TCP_REFUSED);
+    run_and_close_fds(&[fd], || {
+        let rv = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr) as libc::socklen_t,
+            )
+        };
+        errno_is(rv, Some(libc::ECONNREFUSED))
+            .map_err(|e| format!("connect(::1:{PORT_TCP_REFUSED}): {e}"))
+    })
+}
+
+// sendmsg()/recvmsg() with IPv6 addresses
+fn test_udp_sendmsg_recvmsg_v6() -> Result<(), String> {
+    let fd_send = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    let fd_recv = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if fd_send < 0 || fd_recv < 0 {
+        return Err(format!(
+            "socket(AF_INET6, SOCK_DGRAM): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let recv_addr = sockaddr_in6(ipv6_loopback(), PORT_UDP_SENDMSG);
+    run_and_close_fds(&[fd_send, fd_recv], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_recv,
+                &recv_addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&recv_addr) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!("bind: {} ({})", get_errno(), test_utils::get_errno_message(get_errno())));
+        }
+
+        let payload = b"ipv6 sendmsg";
+        let iov = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+        let msg = libc::msghdr {
+            msg_name: &recv_addr as *const _ as *mut libc::c_void,
+            msg_namelen: std::mem::size_of_val(&recv_addr) as libc::socklen_t,
+            msg_iov: &iov as *const _ as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::sendmsg(fd_send, &msg, 0) };
+        if n as usize != payload.len() {
+            return Err(format!("sendmsg sent {n} of {} bytes", payload.len()));
+        }
+
+        let mut buf = [0u8; 64];
+        let mut src: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let mut msg = libc::msghdr {
+            msg_name: &mut src as *mut _ as *mut libc::c_void,
+            msg_namelen: std::mem::size_of_val(&src) as libc::socklen_t,
+            msg_iov: &mut iov as *mut _ as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::recvmsg(fd_recv, &mut msg, 0) };
+        if n as usize != payload.len() {
+            return Err(format!("recvmsg received {n} of {} bytes", payload.len()));
+        }
+        if &buf[..n as usize] != payload {
+            return Err("recvmsg data mismatch".to_string());
+        }
+        if src.sin6_addr.s6_addr != ipv6_loopback() {
+            return Err("recvmsg source address is not ::1".to_string());
+        }
+        Ok(())
+    })
+}
+
+// getaddrinfo("localhost") must include the IPv6 loopback address
+fn test_getaddrinfo_localhost_v6() -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let addrs: Vec<std::net::SocketAddr> = ("localhost", PORT_DNS)
+        .to_socket_addrs()
+        .map_err(|e| format!("getaddrinfo(localhost): {e}"))?
+        .collect();
+
+    let has_v6_loopback = addrs.iter().any(|a| {
+        a.is_ipv6() && a.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    });
+    if !has_v6_loopback {
+        return Err(format!(
+            "getaddrinfo(localhost) returned {addrs:?}, expected it to include [::1]"
+        ));
+    }
+    Ok(())
 }

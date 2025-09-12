@@ -1,0 +1,21 @@
+general:
+  stop_time: 10 s
+network:
+  graph:
+    type: 1_gbit_switch
+hosts:
+  # an explicit IPv6 address is assigned to the server host
+  server:
+    network_node_id: 0
+    ip_addr: 2001:db8::10
+    processes:
+    - path: ../../target/debug/test_ipv6
+      args: "udp-server 21001"
+      start_time: 1 s
+  client:
+    network_node_id: 0
+    processes:
+    - path: ../../target/debug/test_ipv6
+      # resolves "server" to an IPv6 address using getaddrinfo()
+      args: "udp-client 21001"
+      start_time: 2 s
