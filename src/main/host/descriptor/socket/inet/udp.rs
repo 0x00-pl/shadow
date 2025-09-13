@@ -128,8 +128,13 @@ impl UdpSocket {
     ) {
         packet.add_status(PacketStatus::RcvSocketProcessed);
 
+        // on a dual-stack socket, IPv4 packets use IPv4-mapped addresses
+        let dual = self.is_dual_stack();
+        let packet_src = inet::map_v4_for_dual(dual, packet.src_address());
+        let packet_dst = inet::map_v4_for_dual(dual, packet.dst_address());
+
         if let Some(peer_addr) = self.peer_addr
-            && peer_addr != packet.src_address()
+            && peer_addr != packet_src
         {
             // connect(2): "If the socket sockfd is of type SOCK_DGRAM, then addr is the address
             // to which datagrams are sent by default, and the only address from which datagrams
@@ -166,8 +171,8 @@ impl UdpSocket {
         let message = payload.concat();
 
         let header = MessageRecvHeader {
-            src: packet.src_address(),
-            dst: packet.dst_address(),
+            src: packet_src,
+            dst: packet_dst,
             recv_time,
         };
 
@@ -194,7 +199,14 @@ impl UdpSocket {
         log::trace!("Removed a message from the UDP socket's send buffer");
 
         // We transfer the `Bytes` directly from the buffer to the packet without copying them.
-        let packet = PacketRc::new_udp(header.src, header.dst, message, header.packet_priority);
+        // IPv4-mapped addresses are converted back to plain IPv4 addresses for
+        // the simulated network.
+        let packet = PacketRc::new_udp(
+            inet::unmap_for_network(header.src),
+            inet::unmap_for_network(header.dst),
+            message,
+            header.packet_priority,
+        );
         packet.add_status(PacketStatus::SndCreated);
 
         self.refresh_readable_writable(FileSignals::empty(), cb_queue);
@@ -232,6 +244,16 @@ impl UdpSocket {
 
     pub fn address_family(&self) -> linux_api::socket::AddressFamily {
         self.domain
+    }
+
+    pub fn ipv6_only(&self) -> bool {
+        self.ipv6_only
+    }
+
+    /// Returns whether this IPv6 socket also communicates over IPv4
+    /// (`IPV6_V6ONLY` disabled), using IPv4-mapped IPv6 addresses internally.
+    fn is_dual_stack(&self) -> bool {
+        self.domain == linux_api::socket::AddressFamily::AF_INET6 && !self.ipv6_only
     }
 
     pub fn close(&mut self, cb_queue: &mut CallbackQueue) -> Result<(), SyscallError> {
@@ -288,6 +310,10 @@ impl UdpSocket {
         let unspecified_addr = SocketAddr::new(wildcard_for(addr_family(addr.ip())), 0);
 
         // associate the socket
+        let dual = {
+            let socket = socket.borrow();
+            socket.is_dual_stack()
+        };
         let (addr, handle) = inet::associate_socket(
             InetSocket::Udp(Arc::clone(socket)),
             addr,
@@ -295,6 +321,7 @@ impl UdpSocket {
             /* check_generic_peer= */ true,
             net_ns,
             rng,
+            dual,
         )?;
 
         // update the socket's local address
@@ -357,10 +384,11 @@ impl UdpSocket {
 
         // TODO: If we have a peer AND a destination address is provided, should we use the peer or
         // the destination address? Do we have a test for this?
+        let dual = socket_ref.is_dual_stack();
         let dst_addr = match args.addr {
             Some(addr) => match addr.as_std_inet() {
                 // an inet socket address
-                Some(x) => x,
+                Some(x) => inet::map_v4_for_dual(dual, x),
                 // not an inet socket address
                 None => return Err(Errno::EAFNOSUPPORT.into()),
             },
@@ -394,11 +422,12 @@ impl UdpSocket {
 
             // make sure the new peer address is connectable from the bound interface
             if !bound_addr.ip().is_unspecified() {
+                let dst_net = inet::unmap_for_network(dst_addr);
                 // assume that a socket bound to a wildcard address can connect anywhere, so only
                 // check loopback
                 match (
                     bound_addr.ip().is_loopback(),
-                    dst_addr.ip().is_loopback(),
+                    dst_net.ip().is_loopback(),
                 ) {
                     // bound and peer on loopback interface
                     (true, true) => {}
@@ -426,6 +455,7 @@ impl UdpSocket {
                 /* check_generic_peer= */ true,
                 net_ns,
                 rng,
+                dual,
             )?;
 
             socket_ref.bound_addr = Some(local_addr);
@@ -454,17 +484,13 @@ impl UdpSocket {
             let src_addr = if src_addr.ip().is_unspecified() {
                 // depending on the destination address, choose either the loopback or the
                 // interface's default address for the destination's address family
-                if dst_addr.ip().is_loopback() {
-                    SocketAddr::new(
-                        loopback_for(addr_family(dst_addr.ip())),
-                        src_addr.port(),
-                    )
+                let dst_net = inet::unmap_for_network(dst_addr);
+                let src_ip = if dst_net.ip().is_loopback() {
+                    loopback_for(addr_family(dst_net.ip()))
                 } else {
-                    SocketAddr::new(
-                        default_ip_for(addr_family(dst_addr.ip()), net_ns),
-                        src_addr.port(),
-                    )
-                }
+                    default_ip_for(addr_family(dst_net.ip()), net_ns)
+                };
+                inet::map_v4_for_dual(dual, SocketAddr::new(src_ip, src_addr.port()))
             } else {
                 src_addr
             };
@@ -721,6 +747,10 @@ impl UdpSocket {
         };
 
         let mut socket_borrow = socket.borrow_mut();
+        let dual = socket_borrow.is_dual_stack();
+
+        // on a dual-stack socket, IPv4 peers use IPv4-mapped IPv6 addresses
+        let peer_addr = inet::map_v4_for_dual(dual, peer_addr);
 
         // the address family must match the socket's domain
         if addr_family(peer_addr.ip()) != socket_borrow.domain {
@@ -735,12 +765,16 @@ impl UdpSocket {
             peer_addr.set_ip(loopback_for(addr_family(peer_addr.ip())));
         }
 
+        // the address as it will appear on the simulated network (without any
+        // IPv4-mapped representation)
+        let peer_net = inet::unmap_for_network(peer_addr);
+
         // make sure we will be able to route this later
         // TODO: UDP sockets probably shouldn't return `ECONNREFUSED`
-        if !peer_addr.ip().is_loopback() {
+        if !peer_net.ip().is_loopback() {
             let is_routable = Worker::is_routable(
-                default_ip_for(addr_family(peer_addr.ip()), net_ns),
-                peer_addr.ip(),
+                default_ip_for(addr_family(peer_net.ip()), net_ns),
+                peer_net.ip(),
             );
 
             if !is_routable {
@@ -766,7 +800,7 @@ impl UdpSocket {
                     // only check loopback
                     match (
                         bound_addr.ip().is_loopback(),
-                        peer_addr.ip().is_loopback(),
+                        peer_net.ip().is_loopback(),
                     ) {
                         // bound and peer on loopback interface
                         (true, true) => {}
@@ -782,11 +816,13 @@ impl UdpSocket {
                 assert!(socket_ref.association.is_none());
 
                 // implicit bind (use the default interface unless the remote peer is on loopback)
-                let local_addr = if peer_addr.ip().is_loopback() {
-                    SocketAddr::new(loopback_for(addr_family(peer_addr.ip())), 0)
+                let local_ip = if peer_net.ip().is_loopback() {
+                    loopback_for(addr_family(peer_net.ip()))
                 } else {
-                    SocketAddr::new(default_ip_for(addr_family(peer_addr.ip()), net_ns), 0)
+                    default_ip_for(addr_family(peer_net.ip()), net_ns)
                 };
+                let local_addr =
+                    inet::map_v4_for_dual(dual, SocketAddr::new(local_ip, 0));
 
                 // this will allow us to receive packets from any source address, but
                 // `push_in_packet` should drop any packets that aren't from the peer
@@ -794,14 +830,15 @@ impl UdpSocket {
 
                 let (local_addr, handle) = super::associate_socket(
                     InetSocket::Udp(Arc::clone(socket)),
-                    local_addr,
+                    inet::unmap_for_network(local_addr),
                     unspecified_addr,
                     /* check_generic_peer= */ true,
                     net_ns,
                     rng,
+                    dual,
                 )?;
 
-                socket_ref.bound_addr = Some(local_addr);
+                socket_ref.bound_addr = Some(inet::map_v4_for_dual(dual, local_addr));
                 socket_ref.association = Some(handle);
             }
 

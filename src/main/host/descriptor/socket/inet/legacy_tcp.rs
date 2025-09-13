@@ -228,6 +228,11 @@ impl LegacyTcpSocket {
         linux_api::socket::AddressFamily::AF_INET
     }
 
+    // the legacy TCP stack does not support IPv6
+    pub fn ipv6_only(&self) -> bool {
+        false
+    }
+
     pub fn close(&mut self, _cb_queue: &mut CallbackQueue) -> Result<(), SyscallError> {
         Worker::with_active_host(|h| {
             unsafe { c::legacyfile_close(self.as_legacy_file(), h) };
@@ -285,6 +290,7 @@ impl LegacyTcpSocket {
             /* check_generic_peer= */ true,
             net_ns,
             rng,
+            /* dual_stack= */ false,
         )?;
 
         // the legacy TCP stack only supports IPv4
@@ -689,6 +695,7 @@ impl LegacyTcpSocket {
                 /* check_generic_peer= */ true,
                 net_ns,
                 rng,
+                /* dual_stack= */ false,
             )?;
 
             // the legacy TCP stack only supports IPv4
@@ -805,6 +812,7 @@ impl LegacyTcpSocket {
                 /* check_generic_peer= */ true,
                 net_ns,
                 rng,
+                /* dual_stack= */ false,
             )?;
 
             // the legacy TCP stack only supports IPv4
@@ -1047,6 +1055,7 @@ impl LegacyTcpSocket {
                 false,
                 net_ns,
                 rng,
+                /* dual_stack= */ false,
             )?;
             // the handle normally disassociates the socket when dropped, but
             // the C TCP code does its own manual disassociation, so we'll just

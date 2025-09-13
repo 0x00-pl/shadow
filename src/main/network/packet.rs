@@ -360,8 +360,7 @@ impl Packet {
         let dst = hdr.dst;
 
         let tcp_hdr = match &self.data {
-            // The legacy TCP header is obtained with `packet_getTCPHeader()` in the legacy C API.
-            Data::LegacyTcp(_) => unimplemented!(),
+            Data::LegacyTcp(tcp) => tcp.borrow().header.clone(),
             Data::Tcp(tcp) => tcp.header.clone(),
             Data::Udp(_) => return None,
         };
@@ -1273,10 +1272,35 @@ mod export {
         let IpAddr::V4(dst_ip) = packet.header.dst else {
             unimplemented!()
         };
-        let Data::LegacyTcp(tcp_rc) = &packet.data else {
-            unimplemented!()
+
+        // The packet may have been created by either the legacy C TCP stack
+        // or the new Rust TCP stack (for example a legacy IPv4 socket
+        // communicating with a dual-stack IPv6 socket), so support both.
+        let tcp = match &packet.data {
+            Data::LegacyTcp(tcp_rc) => tcp_rc.borrow(),
+            Data::Tcp(tcp) => {
+                // convert the new TCP stack's header to the legacy format
+                let header = &tcp.header;
+                return c::PacketTCPHeader {
+                    flags: tcp_flags_to_legacy_flags(header.flags),
+                    sourceIP: u32::from(src_ip).to_be(),
+                    sourcePort: header.src_port.to_be(),
+                    destinationIP: u32::from(dst_ip).to_be(),
+                    destinationPort: header.dst_port.to_be(),
+                    sequence: header.sequence,
+                    acknowledgment: header.acknowledgement,
+                    selectiveACKs: to_legacy_sel_acks(
+                        header.selective_acks.map(|x| x.into()),
+                    ),
+                    window: u32::from(header.window_size),
+                    windowScale: header.window_scale.unwrap_or(0),
+                    windowScaleSet: header.window_scale.is_some(),
+                    timestampValue: to_legacy_timestamp(header.timestamp),
+                    timestampEcho: to_legacy_timestamp(header.timestamp_echo),
+                };
+            }
+            Data::Udp(_) => unimplemented!(),
         };
-        let tcp = tcp_rc.borrow();
 
         let mut c_hdr: c::PacketTCPHeader = unsafe { MaybeUninit::zeroed().assume_init() };
 

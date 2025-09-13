@@ -153,13 +153,16 @@ impl NetworkNamespace {
         }
     }
 
-    /// Returns a random port in host byte order.
+    /// Returns a random port in host byte order. If `dual_stack` is set, the
+    /// port must also be free on the IPv4 side (for a wildcard IPv6 bind on a
+    /// dual-stack socket).
     pub fn get_random_free_port(
         &self,
         protocol_type: IanaProtocol,
         interface_ip: IpAddr,
         peer: SocketAddr,
         mut rng: impl rand::RngExt,
+        dual_stack: bool,
     ) -> Option<u16> {
         // we need a random port that is free everywhere we need it to be.
         // we have two modes here: first we just try grabbing a random port until we
@@ -169,25 +172,39 @@ impl NetworkNamespace {
         // if choosing randomly doesn't succeed within 10 tries, then we have already
         // allocated a lot of ports (>90% on average). then we fall back to linear search.
         let wildcard_peer = SocketAddr::new(unspecified_like(interface_ip), 0);
-        for _ in 0..10 {
-            let random_port = rng.random_range(MIN_RANDOM_PORT..=u16::MAX);
-
-            // `is_addr_in_use` will check all interfaces in the case of INADDR_ANY
+        // for a dual-stack wildcard IPv6 bind, the port must also be free for
+        // IPv4 (on every interface)
+        let v4_wildcard_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let v4_wildcard_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let port_in_use = |port: u16| -> bool {
             let specific_in_use = self
-                .is_addr_in_use(
-                    protocol_type,
-                    SocketAddr::new(interface_ip, random_port),
-                    peer,
-                )
+                .is_addr_in_use(protocol_type, SocketAddr::new(interface_ip, port), peer)
                 .unwrap_or(true);
             let generic_in_use = self
                 .is_addr_in_use(
                     protocol_type,
-                    SocketAddr::new(interface_ip, random_port),
+                    SocketAddr::new(interface_ip, port),
                     wildcard_peer,
                 )
                 .unwrap_or(true);
-            if !specific_in_use && !generic_in_use {
+            let v4_wildcard_local_with_port =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            let v4_in_use = dual_stack
+                && self
+                    .is_addr_in_use(
+                        protocol_type,
+                        v4_wildcard_local_with_port,
+                        v4_wildcard_peer,
+                    )
+                    .unwrap_or(true);
+            specific_in_use || generic_in_use || v4_in_use
+        };
+
+        for _ in 0..10 {
+            let random_port = rng.random_range(MIN_RANDOM_PORT..=u16::MAX);
+
+            // `is_addr_in_use` will check all interfaces in the case of INADDR_ANY
+            if !port_in_use(random_port) {
                 return Some(random_port);
             }
         }
@@ -197,21 +214,7 @@ impl NetworkNamespace {
         // but start from a random port instead of the min.
         let start = rng.random_range(MIN_RANDOM_PORT..=u16::MAX);
         for port in (start..=u16::MAX).chain(MIN_RANDOM_PORT..start) {
-            let specific_in_use = self
-                .is_addr_in_use(
-                    protocol_type,
-                    SocketAddr::new(interface_ip, port),
-                    peer,
-                )
-                .unwrap_or(true);
-            let generic_in_use = self
-                .is_addr_in_use(
-                    protocol_type,
-                    SocketAddr::new(interface_ip, port),
-                    wildcard_peer,
-                )
-                .unwrap_or(true);
-            if !specific_in_use && !generic_in_use {
+            if !port_in_use(port) {
                 return Some(port);
             }
         }
@@ -232,26 +235,39 @@ impl NetworkNamespace {
         protocol: IanaProtocol,
         bind_addr: SocketAddr,
         peer_addr: SocketAddr,
+        dual_stack: bool,
     ) -> AssociationHandle {
-        if bind_addr.ip().is_unspecified() {
-            // need to associate all interfaces
-            self.localhost
-                .borrow()
-                .associate(socket, protocol, bind_addr.port(), peer_addr);
-            self.internet
-                .borrow()
-                .associate(socket, protocol, bind_addr.port(), peer_addr);
-        } else {
-            // TODO: return error if interface does not exist
-            if let Some(iface) = self.interface_borrow(bind_addr.ip()) {
-                iface.associate(socket, protocol, bind_addr.port(), peer_addr);
+        let mut bindings = vec![(bind_addr, peer_addr)];
+
+        // a dual-stack socket bound to the IPv6 wildcard address also
+        // communicates over IPv4, so it must also be associated under the IPv4
+        // wildcard address
+        if dual_stack && bind_addr.is_ipv6() && bind_addr.ip().is_unspecified() {
+            let v4_bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_addr.port());
+            let v4_peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), peer_addr.port());
+            bindings.push((v4_bind_addr, v4_peer_addr));
+        }
+
+        for (bind_addr, peer_addr) in &bindings {
+            if bind_addr.ip().is_unspecified() {
+                // need to associate all interfaces
+                self.localhost
+                    .borrow()
+                    .associate(socket, protocol, bind_addr.port(), *peer_addr);
+                self.internet
+                    .borrow()
+                    .associate(socket, protocol, bind_addr.port(), *peer_addr);
+            } else {
+                // TODO: return error if interface does not exist
+                if let Some(iface) = self.interface_borrow(bind_addr.ip()) {
+                    iface.associate(socket, protocol, bind_addr.port(), *peer_addr);
+                }
             }
         }
 
         AssociationHandle {
             protocol,
-            local_addr: bind_addr,
-            remote_addr: peer_addr,
+            bindings,
         }
     }
 
@@ -280,6 +296,13 @@ impl NetworkNamespace {
             if let Some(iface) = self.interface_borrow(bind_addr.ip()) {
                 iface.disassociate(protocol, bind_addr.port(), peer_addr);
             }
+        }
+    }
+
+    /// Disassociate all of the bindings in the given list.
+    fn disassociate_bindings(&self, protocol: IanaProtocol, bindings: &[(SocketAddr, SocketAddr)]) {
+        for (bind_addr, peer_addr) in bindings {
+            self.disassociate_interface(protocol, *bind_addr, *peer_addr);
         }
     }
 }
@@ -319,28 +342,31 @@ impl std::error::Error for NoInterface {}
 #[derive(Debug)]
 pub struct AssociationHandle {
     protocol: IanaProtocol,
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
+    /// The (local, peer) address pairs that the socket is associated under. A
+    /// dual-stack socket bound to the IPv6 wildcard address has both an IPv6
+    /// and an IPv4 binding.
+    bindings: Vec<(SocketAddr, SocketAddr)>,
 }
 
 impl AssociationHandle {
+    /// Returns the socket's primary local address (the IPv6 binding for
+    /// dual-stack sockets).
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.bindings.first().unwrap().0
     }
 
+    /// Returns the socket's primary peer address (the IPv6 binding for
+    /// dual-stack sockets).
     pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
+        self.bindings.first().unwrap().1
     }
 }
 
 impl std::ops::Drop for AssociationHandle {
     fn drop(&mut self) {
         Worker::with_active_host(|host| {
-            host.network_namespace_borrow().disassociate_interface(
-                self.protocol,
-                self.local_addr,
-                self.remote_addr,
-            );
+            host.network_namespace_borrow()
+                .disassociate_bindings(self.protocol, &self.bindings);
         })
         .unwrap();
     }

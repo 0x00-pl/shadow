@@ -42,6 +42,9 @@ pub struct TcpSocket {
     shutdown_status: Option<Shutdown>,
     /// The socket's address family, as given at socket creation time.
     domain: linux_api::socket::AddressFamily,
+    /// The value of the `IPV6_V6ONLY` socket option. Only meaningful for
+    /// IPv6 sockets.
+    ipv6_only: bool,
     /// The values of the `SO_RCVTIMEO`/`SO_SNDTIMEO` socket options. Stored
     /// for `getsockopt()`, but not currently enforced.
     recv_timeout: std::time::Duration,
@@ -74,6 +77,7 @@ impl TcpSocket {
                 connect_result_is_pending: false,
                 shutdown_status: None,
                 domain,
+                ipv6_only: false,
                 recv_timeout: std::time::Duration::ZERO,
                 send_timeout: std::time::Duration::ZERO,
                 has_open_file: false,
@@ -142,13 +146,14 @@ impl TcpSocket {
             // First try getting our IP address from the tcp state (if it's connected), then try
             // from the association handle (if it's not connected but is bound). Assume that our IP
             // address will match an interface's IP address.
-            let interface_ip = self
-                .tcp_state
-                .local_remote_addrs()
-                .map(|x| x.0)
-                .or(self.association.as_ref().map(|x| x.local_addr()))
-                .unwrap()
-                .ip();
+            let interface_ip = inet::unmap_ip_for_network(
+                self.tcp_state
+                    .local_remote_addrs()
+                    .map(|x| x.0)
+                    .or(self.association.as_ref().map(|x| x.local_addr()))
+                    .unwrap()
+                    .ip(),
+            );
 
             cb_queue.add(move |_cb_queue| {
                 Worker::with_active_host(|host| {
@@ -217,9 +222,16 @@ impl TcpSocket {
         // TODO: we have no way of adding `PacketStatus::RcvSocketDropped` if the tcp state drops
         // the packet
 
-        let header = packet
+        let mut header = packet
             .tcp_header()
             .expect("TCP socket received a non-tcp packet");
+
+        // on a dual-stack socket, IPv4 packets use IPv4-mapped addresses
+        let dual = self.is_dual_stack();
+        if dual {
+            header.ip.src = inet::map_ip_v4_for_dual(dual, header.ip.src);
+            header.ip.dst = inet::map_ip_v4_for_dual(dual, header.ip.dst);
+        }
 
         // transfer the `Bytes` objects directly from the payload to the tcp state without copying
         // the bytes themselves
@@ -251,7 +263,7 @@ impl TcpSocket {
         // pop a packet from the socket
         let rv = self.with_tcp_state(cb_queue, |s| s.pop_packet());
 
-        let (header, payload) = match rv {
+        let (mut header, payload) = match rv {
             Ok(x) => x,
             Err(tcp::PopPacketError::NoPacket) => {
                 #[cfg(debug_assertions)]
@@ -269,7 +281,10 @@ impl TcpSocket {
         debug_assert!(wants_to_send);
 
         // We transfer the `Bytes` objects directly from the tcp state's `Payload` object to the
-        // packet without copying the bytes themselves.
+        // packet without copying the bytes themselves. IPv4-mapped addresses are
+        // converted back to plain IPv4 addresses for the simulated network.
+        header.ip.src = inet::unmap_ip_for_network(header.ip.src);
+        header.ip.dst = inet::unmap_ip_for_network(header.ip.dst);
         // TODO: set packet priority?
         let packet = PacketRc::new_tcp(header, payload, 0);
         packet.add_status(PacketStatus::SndCreated);
@@ -290,14 +305,14 @@ impl TcpSocket {
         // The socket state won't always have the local address. For example if the socket was bound
         // but connect() hasn't yet been called, the socket state will not have a local or remote
         // address. Instead we should get the local address from the association.
+        let dual = self.is_dual_stack();
         let addr = self
             .association
             .as_ref()
-            .map(|x| x.local_addr())
-            .unwrap_or(SocketAddr::new(
-                wildcard_for(self.address_family()),
-                0,
-            ));
+            .map(|x| inet::map_v4_for_dual(dual, x.local_addr()))
+            .unwrap_or_else(|| {
+                SocketAddr::new(wildcard_for(self.address_family()), 0)
+            });
         Ok(Some(addr.into()))
     }
 
@@ -308,8 +323,9 @@ impl TcpSocket {
         Ok(Some(
             self.tcp_state
                 .local_remote_addrs()
-                .map(|x| x.1.into())
-                .ok_or(Errno::ENOTCONN)?,
+                .map(|x| inet::map_v4_for_dual(self.is_dual_stack(), x.1))
+                .ok_or(Errno::ENOTCONN)?
+                .into(),
         ))
 
         // TODO: This will not have the remote address once the tcp state has closed (for example by
@@ -322,6 +338,16 @@ impl TcpSocket {
 
     pub fn address_family(&self) -> linux_api::socket::AddressFamily {
         self.domain
+    }
+
+    pub fn ipv6_only(&self) -> bool {
+        self.ipv6_only
+    }
+
+    /// Returns whether this IPv6 socket also communicates over IPv4
+    /// (`IPV6_V6ONLY` disabled), using IPv4-mapped IPv6 addresses internally.
+    fn is_dual_stack(&self) -> bool {
+        self.domain == linux_api::socket::AddressFamily::AF_INET6 && !self.ipv6_only
     }
 
     pub fn close(&mut self, cb_queue: &mut CallbackQueue) -> Result<(), SyscallError> {
@@ -368,6 +394,8 @@ impl TcpSocket {
             return Err(Errno::EINVAL.into());
         }
 
+        let dual = socket_ref.is_dual_stack();
+
         // this will allow us to receive packets from any peer
         let peer_addr = SocketAddr::new(wildcard_for(addr_family(addr.ip())), 0);
 
@@ -379,6 +407,7 @@ impl TcpSocket {
             /* check_generic_peer= */ true,
             net_ns,
             rng,
+            dual,
         )?;
 
         socket_ref.association = Some(handle);
@@ -577,6 +606,7 @@ impl TcpSocket {
 
         let is_associated = socket_ref.association.is_some();
         let domain = socket_ref.domain;
+        let dual = socket_ref.is_dual_stack();
 
         let rv = if is_associated {
             // if already associated, do nothing
@@ -600,6 +630,7 @@ impl TcpSocket {
                     /* check_generic_peer= */ true,
                     net_ns,
                     rng,
+                    dual,
                 )?;
 
                 Ok::<_, Errno>(Some(handle))
@@ -664,6 +695,10 @@ impl TcpSocket {
             return Err(Errno::EINVAL.into());
         };
 
+        // on a dual-stack socket, IPv4 peers use IPv4-mapped IPv6 addresses
+        let dual = socket_ref.is_dual_stack();
+        let peer_addr = inet::map_v4_for_dual(dual, peer_addr);
+
         // the address family must match the socket's domain
         if addr_family(peer_addr.ip()) != socket_ref.domain {
             return Err(Errno::EINVAL.into());
@@ -677,17 +712,22 @@ impl TcpSocket {
             peer_addr.set_ip(loopback_for(addr_family(peer_addr.ip())));
         }
 
+        // the peer address as it will appear on the simulated network (without
+        // any IPv4-mapped representation)
+        let peer_net = inet::unmap_for_network(peer_addr);
+
         let local_addr = socket_ref.association.as_ref().map(|x| x.local_addr());
 
         let rv = if let Some(mut local_addr) = local_addr {
             // the local address needs to be a specific address (this is normally what a routing
             // table would figure out for us)
             if local_addr.ip().is_unspecified() {
-                if peer_addr.ip().is_loopback() {
-                    local_addr.set_ip(loopback_for(addr_family(peer_addr.ip())))
+                let local_ip = if peer_net.ip().is_loopback() {
+                    loopback_for(addr_family(peer_net.ip()))
                 } else {
-                    local_addr.set_ip(default_ip_for(addr_family(peer_addr.ip()), net_ns))
+                    default_ip_for(addr_family(peer_net.ip()), net_ns)
                 };
+                local_addr.set_ip(inet::map_v4_for_dual(dual, SocketAddr::new(local_ip, 0)).ip());
             }
 
             // it's already associated so use the existing address
@@ -698,26 +738,27 @@ impl TcpSocket {
             let associate_fn = || {
                 // the local address needs to be a specific address (this is normally what a routing
                 // table would figure out for us)
-                let local_addr = if peer_addr.ip().is_loopback() {
-                    loopback_for(addr_family(peer_addr.ip()))
+                let local_ip = if peer_net.ip().is_loopback() {
+                    loopback_for(addr_family(peer_net.ip()))
                 } else {
-                    default_ip_for(addr_family(peer_addr.ip()), net_ns)
+                    default_ip_for(addr_family(peer_net.ip()), net_ns)
                 };
 
                 // add a wildcard port number
-                let local_addr = SocketAddr::new(local_addr, 0);
+                let local_addr = inet::map_v4_for_dual(dual, SocketAddr::new(local_ip, 0));
 
                 let (local_addr, handle) = inet::associate_socket(
                     InetSocket::Tcp(Arc::clone(socket)),
-                    local_addr,
-                    peer_addr,
+                    inet::unmap_for_network(local_addr),
+                    peer_net,
                     /* check_generic_peer= */ true,
                     net_ns,
                     rng,
+                    dual,
                 )?;
 
                 // use the actual local address that was assigned (will have port != 0)
-                Ok((local_addr, Some(handle)))
+                Ok((inet::map_v4_for_dual(dual, local_addr), Some(handle)))
             };
             socket_ref.with_tcp_state(cb_queue, |state| state.connect(peer_addr, associate_fn))
         };
@@ -785,8 +826,10 @@ impl TcpSocket {
             Err(tcp::AcceptError::NothingToAccept) => return Err(Errno::EAGAIN.into()),
         };
 
-        let local_addr = accepted_state.local_addr();
-        let remote_addr = accepted_state.remote_addr();
+        // IPv4 connections on a dual-stack listener use IPv4-mapped addresses
+        // internally; the association uses the plain IPv4 addresses.
+        let local_addr = inet::unmap_for_network(accepted_state.local_addr());
+        let remote_addr = inet::unmap_for_network(accepted_state.remote_addr());
 
         // convert the accepted tcp state to a full tcp socket
         let new_socket = Arc::new_cyclic(|weak: &Weak<AtomicRefCell<Self>>| {
@@ -810,6 +853,7 @@ impl TcpSocket {
                 connect_result_is_pending: false,
                 shutdown_status: None,
                 domain: self.address_family(),
+                ipv6_only: self.ipv6_only,
                 recv_timeout: self.recv_timeout,
                 send_timeout: self.send_timeout,
                 has_open_file: false,
@@ -833,6 +877,7 @@ impl TcpSocket {
             /* check_generic_peer= */ false,
             net_ns,
             rng,
+            self.is_dual_stack(),
         )?;
 
         new_socket.borrow_mut().association = Some(handle);
@@ -959,6 +1004,14 @@ impl TcpSocket {
 
                 Ok(bytes_written as libc::socklen_t)
             }
+            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) => {
+                let val: libc::c_int = self.ipv6_only.into();
+
+                let optval_ptr = optval_ptr.cast::<libc::c_int>();
+                let bytes_written = write_partial(mem, &val, optval_ptr, optlen as usize)?;
+
+                Ok(bytes_written as libc::socklen_t)
+            }
             (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
                 let timeout = match (level, optname) {
                     (libc::SOL_SOCKET, libc::SO_RCVTIMEO) => self.recv_timeout,
@@ -1007,6 +1060,23 @@ impl TcpSocket {
             (libc::SOL_SOCKET, libc::SO_KEEPALIVE) => {
                 // TODO: implement this, libevent uses it in evconnlistener_new_bind()
                 log::trace!("setsockopt SO_KEEPALIVE not yet implemented");
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) => {
+                type OptType = libc::c_int;
+
+                if usize::try_from(optlen).unwrap() < std::mem::size_of::<OptType>() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                let optval_ptr = optval_ptr.cast::<OptType>();
+                let val: libc::c_int = mem.read(optval_ptr)?;
+
+                // the option can only be set before a socket is bound
+                if self.association.is_some() {
+                    return Err(Errno::EINVAL.into());
+                }
+
+                self.ipv6_only = val != 0;
             }
             (libc::SOL_SOCKET, libc::SO_RCVTIMEO) | (libc::SOL_SOCKET, libc::SO_SNDTIMEO) => {
                 type OptType = libc::timeval;

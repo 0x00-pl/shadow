@@ -1194,6 +1194,7 @@ mod export {
                 IpAddr::V4(interface_ip),
                 SocketAddr::V4(peer_addr),
                 hostrc.random.borrow_mut().deref_mut(),
+                /* dual_stack= */ false,
             )
             .unwrap_or(0)
             .to_be()

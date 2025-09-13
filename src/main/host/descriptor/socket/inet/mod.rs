@@ -1,5 +1,5 @@
 
-use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 
 use atomic_refcell::AtomicRefCell;
@@ -299,6 +299,9 @@ impl InetSocketRef<'_> {
     enum_passthrough!(self, (), LegacyTcp, Tcp, Udp;
         pub fn address_family(&self) -> linux_api::socket::AddressFamily
     );
+    enum_passthrough!(self, (), LegacyTcp, Tcp, Udp;
+        pub fn ipv6_only(&self) -> bool
+    );
 }
 
 // inet socket-specific functions
@@ -395,6 +398,9 @@ impl InetSocketRefMut<'_> {
 
     enum_passthrough!(self, (), LegacyTcp, Tcp, Udp;
         pub fn address_family(&self) -> linux_api::socket::AddressFamily
+    );
+    enum_passthrough!(self, (), LegacyTcp, Tcp, Udp;
+        pub fn ipv6_only(&self) -> bool
     );
 
     enum_passthrough!(self, (level, optname, optval_ptr, optlen, memory_manager, cb_queue), LegacyTcp, Tcp, Udp;
@@ -508,6 +514,9 @@ fn associate_socket(
     check_generic_peer: bool,
     net_ns: &NetworkNamespace,
     rng: impl rand::Rng,
+    // Whether the socket is a dual-stack IPv6 socket (IPV6_V6ONLY disabled).
+    // Passed by the caller since the socket may already be mutably borrowed.
+    dual_stack: bool,
 ) -> Result<(SocketAddr, AssociationHandle), Errno> {
     log::trace!("Trying to associate socket with addresses (local={local_addr}, peer={peer_addr})");
 
@@ -529,8 +538,13 @@ fn associate_socket(
     let local_addr = if local_addr.port() != 0 {
         local_addr
     } else {
-        let Some(new_port) = net_ns.get_random_free_port(protocol, local_addr.ip(), peer_addr, rng)
-        else {
+        let Some(new_port) = net_ns.get_random_free_port(
+            protocol,
+            local_addr.ip(),
+            peer_addr,
+            rng,
+            dual_stack,
+        ) else {
             log::debug!("Association required an ephemeral port but none are available");
             return Err(Errno::EADDRINUSE);
         };
@@ -557,6 +571,26 @@ fn associate_socket(
         Ok(false) => {}
     }
 
+    // for a dual-stack wildcard IPv6 bind, the IPv4 side must be free too
+    let v4_wildcard_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let v4_wildcard_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    if dual_stack && local_addr.is_ipv6() && local_addr.ip().is_unspecified() {
+        match net_ns.is_addr_in_use(
+            protocol,
+            SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_addr.port())),
+            v4_wildcard_peer,
+        ) {
+            Ok(true) => {
+                log::debug!(
+                    "The IPv4 side of the addresses (local={local_addr}) are not available"
+                );
+                return Err(Errno::EADDRINUSE);
+            }
+            Err(_e) => return Err(Errno::EADDRNOTAVAIL),
+            Ok(false) => {}
+        }
+    }
+
     if check_generic_peer {
         match net_ns.is_addr_in_use(protocol, local_addr, generic_peer) {
             Ok(true) => {
@@ -568,12 +602,79 @@ fn associate_socket(
             Err(_e) => return Err(Errno::EADDRNOTAVAIL),
             Ok(false) => {}
         }
+        if dual_stack && local_addr.is_ipv6() && local_addr.ip().is_unspecified() {
+            match net_ns.is_addr_in_use(
+                protocol,
+                SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_addr.port())),
+                v4_wildcard_peer,
+            ) {
+                Ok(true) => {
+                    log::debug!("The generic IPv4 addresses (local={local_addr}) are not available");
+                    return Err(Errno::EADDRINUSE);
+                }
+                Err(_e) => return Err(Errno::EADDRNOTAVAIL),
+                Ok(false) => {}
+            }
+        }
     }
 
     // associate the interfaces corresponding to addr with socket
-    let handle = unsafe { net_ns.associate_interface(&socket, protocol, local_addr, peer_addr) };
+    let handle = unsafe {
+        net_ns.associate_interface(&socket, protocol, local_addr, peer_addr, dual_stack)
+    };
 
     Ok((local_addr, handle))
+}
+
+/// Returns whether a socket of the given domain with the given `IPV6_V6ONLY`
+/// setting can communicate over IPv4.
+pub(crate) fn supports_ipv4(
+    domain: linux_api::socket::AddressFamily,
+    ipv6_only: bool,
+) -> bool {
+    domain == linux_api::socket::AddressFamily::AF_INET
+        || (domain == linux_api::socket::AddressFamily::AF_INET6 && !ipv6_only)
+}
+
+/// On a dual-stack socket, represents IPv4 addresses as IPv4-mapped IPv6
+/// addresses. This is the representation that applications observe through
+/// e.g. `recvfrom()` on a dual-stack socket.
+pub(crate) fn map_v4_for_dual(dual_stack: bool, addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match (dual_stack, addr) {
+        (true, std::net::SocketAddr::V4(a)) => std::net::SocketAddr::V6(
+            std::net::SocketAddrV6::new(a.ip().to_ipv6_mapped(), a.port(), 0, 0),
+        ),
+        _ => addr,
+    }
+}
+
+/// On a dual-stack socket, represents IPv4 addresses as IPv4-mapped IPv6
+/// addresses (see [`map_v4_for_dual`]).
+pub(crate) fn map_ip_v4_for_dual(dual_stack: bool, addr: std::net::IpAddr) -> std::net::IpAddr {
+    match (dual_stack, addr) {
+        (true, std::net::IpAddr::V4(a)) => std::net::IpAddr::V6(a.to_ipv6_mapped()),
+        _ => addr,
+    }
+}
+
+/// Converts IPv4-mapped IPv6 addresses back to plain IPv4 addresses (leaving
+/// all other addresses unchanged). The simulated network only deals with
+/// unmapped addresses.
+pub(crate) fn unmap_ip_for_network(addr: std::net::IpAddr) -> std::net::IpAddr {
+    match addr {
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => addr,
+        },
+        _ => addr,
+    }
+}
+
+/// Converts IPv4-mapped IPv6 addresses back to plain IPv4 addresses (leaving
+/// all other addresses unchanged). The simulated network only deals with
+/// unmapped addresses.
+pub(crate) fn unmap_for_network(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    SocketAddr::new(unmap_ip_for_network(addr.ip()), addr.port())
 }
 
 /// Returns the address family corresponding to `addr`.

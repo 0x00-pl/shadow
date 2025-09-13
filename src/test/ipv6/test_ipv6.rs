@@ -3,17 +3,17 @@
  * See LICENSE for licensing information
  */
 
-//! Tests for IPv6-related socket operations.
-//!
-//! Shadow supports IPv6, but not dual-stack sockets: a socket bound to `::`
-//! with `IPV6_V6ONLY=0` does not conflict with (or receive traffic for) IPv4
-//! addresses on the same port like it would on Linux.
-//! `test_dual_stack_bind_v6_connect_v4` is an intentional "not yet
-//! implemented" marker for that behavior.
+//! Tests for IPv6-related socket operations, including dual-stack sockets
+//! (an IPv6 socket with `IPV6_V6ONLY` disabled that also communicates over
+//! IPv4 using IPv4-mapped IPv6 addresses).
 //!
 //! Under native Linux (the "--libc-passing" environment) the full IPv6 socket
 //! API is exercised and must pass, validating the tests themselves against
 //! real kernel behavior.
+//!
+//! Known limitation: shadow does not send RST packets for connections to
+//! closed ports, so `test_tcp_connect_refused_v6` (which relies on the kernel
+//! sending an RST) only runs outside of shadow.
 
 use std::thread;
 
@@ -30,6 +30,8 @@ const PORT_DUAL_STACK: u16 = 22106;
 const PORT_TCP_REFUSED: u16 = 22107;
 const PORT_UDP_SENDMSG: u16 = 22108;
 const PORT_DNS: u16 = 22109;
+const PORT_DUAL_UDP_V4: u16 = 22110;
+const PORT_DUAL_TCP_V4: u16 = 22111;
 
 fn main() -> Result<(), String> {
     // two-host simulation tests run this binary with a role argument; the
@@ -147,10 +149,12 @@ fn get_tests() -> Vec<test_utils::ShadowTest<(), String>> {
             test_dual_stack_bind_v6_connect_v4,
             set![TestEnv::Libc, TestEnv::Shadow],
         ),
+        // shadow does not generate RSTs for closed ports, so the connect
+        // would block forever instead of returning ECONNREFUSED
         test_utils::ShadowTest::new(
             "test_tcp_connect_refused_v6",
             test_tcp_connect_refused_v6,
-            set![TestEnv::Libc, TestEnv::Shadow],
+            set![TestEnv::Libc],
         ),
         test_utils::ShadowTest::new(
             "test_udp_sendmsg_recvmsg_v6",
@@ -160,6 +164,16 @@ fn get_tests() -> Vec<test_utils::ShadowTest<(), String>> {
         test_utils::ShadowTest::new(
             "test_getaddrinfo_localhost_v6",
             test_getaddrinfo_localhost_v6,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_dual_stack_udp_recv_v4",
+            test_dual_stack_udp_recv_v4,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_dual_stack_tcp_v4_echo",
+            test_dual_stack_tcp_v4_echo,
             set![TestEnv::Libc, TestEnv::Shadow],
         ),
     ]);
@@ -1001,5 +1015,211 @@ fn test_getaddrinfo_localhost_v6() -> Result<(), String> {
             "getaddrinfo(localhost) returned {addrs:?}, expected it to include [::1]"
         ));
     }
+    Ok(())
+}
+
+// a dual-stack socket bound to :: must receive IPv4 traffic, with the peer
+// address reported as an IPv4-mapped IPv6 address
+fn test_dual_stack_udp_recv_v4() -> Result<(), String> {
+    let fd_v6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    let fd_v4 = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd_v6 < 0 || fd_v4 < 0 {
+        return Err(format!(
+            "socket(): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let v6_any = sockaddr_in6(ipv6_unspecified(), PORT_DUAL_UDP_V4);
+    let v4_loopback = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_DUAL_UDP_V4.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
+    run_and_close_fds(&[fd_v6, fd_v4], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_v6,
+                &v6_any as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&v6_any) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!("bind(::): {} ({})", get_errno(), test_utils::get_errno_message(get_errno())));
+        }
+
+        let payload = b"dual-stack udp";
+        let n = unsafe {
+            libc::sendto(
+                fd_v4,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+                0,
+                &v4_loopback as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&v4_loopback) as libc::socklen_t,
+            )
+        };
+        if n as usize != payload.len() {
+            return Err(format!("sendto sent {n} of {} bytes", payload.len()));
+        }
+
+        let mut buf = [0u8; 64];
+        let mut src: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut src_len = std::mem::size_of_val(&src) as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                fd_v6,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut src as *mut _ as *mut libc::sockaddr,
+                &mut src_len,
+            )
+        };
+        if n as usize != payload.len() {
+            return Err(format!("recvfrom received {n} of {} bytes", payload.len()));
+        }
+        if &buf[..n as usize] != payload {
+            return Err("recvfrom data mismatch".to_string());
+        }
+
+        // the peer must be reported as an IPv4-mapped IPv6 address
+        let Some(mapped) = std::net::Ipv6Addr::from(src.sin6_addr.s6_addr).to_ipv4_mapped() else {
+            return Err(format!(
+                "recvfrom peer is {}, expected an IPv4-mapped address",
+                std::net::Ipv6Addr::from(src.sin6_addr.s6_addr)
+            ));
+        };
+        if mapped != std::net::Ipv4Addr::LOCALHOST {
+            return Err(format!("recvfrom peer is ::ffff:{mapped}, expected ::ffff:127.0.0.1"));
+        }
+        Ok(())
+    })
+}
+
+// a dual-stack listener bound to :: must accept IPv4 connections
+fn test_dual_stack_tcp_v4_echo() -> Result<(), String> {
+    use std::thread;
+
+    let listen_fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+    if listen_fd < 0 {
+        return Err(format!(
+            "socket(AF_INET6, SOCK_STREAM): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let v6_any = sockaddr_in6(ipv6_unspecified(), PORT_DUAL_TCP_V4);
+    let v4_loopback_addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_DUAL_TCP_V4.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
+    // set SO_REUSEADDR so a re-run of the test in a time-wait state still binds
+    let reuse: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            listen_fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &reuse as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&reuse) as libc::socklen_t,
+        )
+    };
+
+    let rv = unsafe {
+        libc::bind(
+            listen_fd,
+            &v6_any as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(&v6_any) as libc::socklen_t,
+        )
+    };
+    if rv != 0 {
+        return Err(format!(
+            "bind(::): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+    let rv = unsafe { libc::listen(listen_fd, 1) };
+    if rv != 0 {
+        return Err(format!("listen(): {}", test_utils::get_errno()));
+    }
+
+    let payload = b"dual-stack tcp";
+
+    let client = thread::spawn(move || {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let rv = unsafe {
+            libc::connect(
+                fd,
+                &v4_loopback_addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&v4_loopback_addr) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            panic!("connect(127.0.0.1): {}", test_utils::get_errno());
+        }
+        let n = unsafe {
+            libc::send(fd, payload.as_ptr() as *const libc::c_void, payload.len(), 0)
+        };
+        if n as usize != payload.len() {
+            panic!("send sent {n} of {} bytes", payload.len());
+        }
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if n as usize != payload.len() || &buf[..n as usize] != payload {
+            panic!("echo mismatch");
+        }
+        unsafe { libc::close(fd) };
+    });
+
+    let conn_fd = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if conn_fd < 0 {
+        return Err(format!("accept(): {} ({})", get_errno(), test_utils::get_errno_message(get_errno())));
+    }
+
+    // the accepted connection's peer must be reported as IPv4-mapped
+    let mut peer: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+    let rv = unsafe {
+        libc::getpeername(conn_fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut len)
+    };
+    if rv != 0 {
+        return Err(format!("getpeername(): {}", test_utils::get_errno()));
+    }
+    let peer_v6 = std::net::Ipv6Addr::from(peer.sin6_addr.s6_addr);
+    if peer_v6.to_ipv4_mapped() != Some(std::net::Ipv4Addr::LOCALHOST) {
+        return Err(format!("accepted peer is {peer_v6}, expected ::ffff:127.0.0.1"));
+    }
+
+    let mut buf = [0u8; 64];
+    let n = unsafe { libc::recv(conn_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    if n as usize != payload.len() {
+        return Err(format!("recv received {n} of {} bytes", payload.len()));
+    }
+    let n = unsafe {
+        libc::send(conn_fd, buf.as_ptr() as *const libc::c_void, n as usize, 0)
+    };
+    if n as usize != payload.len() {
+        return Err(format!("echo sent {n} bytes"));
+    }
+
+    unsafe { libc::close(conn_fd) };
+    unsafe { libc::close(listen_fd) };
+    client.join().map_err(|_| "client thread panicked".to_string())?;
+
     Ok(())
 }
