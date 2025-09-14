@@ -14,6 +14,11 @@
 //! Known limitation: shadow does not send RST packets for connections to
 //! closed ports, so `test_tcp_connect_refused_v6` (which relies on the kernel
 //! sending an RST) only runs outside of shadow.
+//!
+//! The two-host simulation tests (see udp-two-hosts.yaml and
+//! tcp-two-hosts.yaml) use this binary with role arguments; the tcp
+//! simulations should run with `--use-new-tcp true` since the legacy C TCP
+//! stack does not support IPv6.
 
 use std::thread;
 

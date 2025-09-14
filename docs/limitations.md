@@ -44,12 +44,14 @@ addresses.
 
 Known limitations:
 
-- Dual-stack sockets are not fully implemented: an IPv6 socket with
-  `IPV6_V6ONLY` disabled does not accept IPv4 traffic (using IPv4-mapped
-  addresses) as it would on Linux, and does not conflict with IPv4 binds on the
-  same port.
 - The legacy (C) TCP stack does not support IPv6; IPv6 TCP sockets always use
-  the new Rust TCP stack, even when `use_new_tcp` is disabled.
+  the new Rust TCP stack, even when `use_new_tcp` is disabled. Since the two
+  stacks do not interoperate, simulations mixing IPv6 TCP with legacy IPv4 TCP
+  on the same host should enable the new TCP stack (which is the default for
+  IPv6 sockets) via `--use-new-tcp true`.
+- Shadow does not send RST packets for connections to closed ports, so a TCP
+  `connect()` to an unbound port blocks instead of returning `ECONNREFUSED`
+  (this applies to both address families).
 
 ## Statically linked executables
 
