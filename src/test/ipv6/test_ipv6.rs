@@ -37,6 +37,8 @@ const PORT_UDP_SENDMSG: u16 = 22108;
 const PORT_DNS: u16 = 22109;
 const PORT_DUAL_UDP_V4: u16 = 22110;
 const PORT_DUAL_TCP_V4: u16 = 22111;
+const PORT_DUAL_UDP_SENDTO: u16 = 22112;
+const PORT_V6ONLY_ISOLATION: u16 = 22113;
 
 fn main() -> Result<(), String> {
     // two-host simulation tests run this binary with a role argument; the
@@ -44,7 +46,12 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(role) = args
         .iter()
-        .find(|x| matches!(x.as_str(), "udp-server" | "udp-client" | "tcp-server" | "tcp-client"))
+        .find(|x| {
+            matches!(
+                x.as_str(),
+                "udp-server" | "udp-client" | "tcp-server" | "tcp-client" | "dual-tcp-client"
+            )
+        })
     {
         let port: u16 = args
             .iter()
@@ -181,6 +188,26 @@ fn get_tests() -> Vec<test_utils::ShadowTest<(), String>> {
             test_dual_stack_tcp_v4_echo,
             set![TestEnv::Libc, TestEnv::Shadow],
         ),
+        test_utils::ShadowTest::new(
+            "test_dual_stack_bind_conflict_v4_first",
+            test_dual_stack_bind_conflict_v4_first,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_v6only_bind_no_conflict_with_v4",
+            test_v6only_bind_no_conflict_with_v4,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_v6only_no_v4_traffic",
+            test_v6only_no_v4_traffic,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
+        test_utils::ShadowTest::new(
+            "test_dual_stack_udp_sendto_v4",
+            test_dual_stack_udp_sendto_v4,
+            set![TestEnv::Libc, TestEnv::Shadow],
+        ),
     ]);
 
     tests
@@ -269,6 +296,76 @@ fn run_role(role: &str, port: u16) -> Result<(), String> {
 
             stream.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
             println!("tcp-server: ok (peer {peer})");
+            Ok(())
+        }
+        "dual-tcp-client" => {
+            // resolve the server to its IPv4 address, then connect over a
+            // dual-stack IPv6 socket using an IPv4-mapped destination address
+            let v4 = ("server", port)
+                .to_socket_addrs()
+                .map_err(|e| format!("getaddrinfo(server): {e}"))?
+                .find(|a| a.is_ipv4())
+                .ok_or_else(|| "getaddrinfo(server) returned no IPv4 address".to_string())?;
+            let std::net::SocketAddr::V4(v4) = v4 else {
+                return Err("getaddrinfo(server) returned a non-IPv4 address".to_string());
+            };
+            let mapped = SocketAddr::V6(std::net::SocketAddrV6::new(
+                v4.ip().to_ipv6_mapped(),
+                v4.port(),
+                0,
+                0,
+            ));
+
+            let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                return Err(format!(
+                    "socket(AF_INET6): {} ({})",
+                    test_utils::get_errno(),
+                    test_utils::get_errno_message(test_utils::get_errno()),
+                ));
+            }
+
+            let sockaddr = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as u16,
+                sin6_port: mapped.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: match mapped.ip() {
+                        std::net::IpAddr::V6(a) => a.octets(),
+                        _ => unreachable!("mapped address is IPv6"),
+                    },
+                },
+                sin6_scope_id: 0,
+            };
+            let rv = unsafe {
+                libc::connect(
+                    fd,
+                    &sockaddr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&sockaddr) as libc::socklen_t,
+                )
+            };
+            if rv != 0 {
+                return Err(format!(
+                    "connect({mapped}): {} ({})",
+                    test_utils::get_errno(),
+                    test_utils::get_errno_message(test_utils::get_errno()),
+                ));
+            }
+
+            let n = unsafe {
+                libc::send(fd, PAYLOAD.as_ptr() as *const libc::c_void, PAYLOAD.len(), 0)
+            };
+            if n as usize != PAYLOAD.len() {
+                return Err(format!("send sent {n} of {} bytes", PAYLOAD.len()));
+            }
+
+            let mut buf = [0u8; 256];
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n as usize != PAYLOAD.len() || &buf[..n as usize] != PAYLOAD {
+                return Err("echo mismatch".to_string());
+            }
+            unsafe { libc::close(fd) };
+            println!("dual-tcp-client: ok ({mapped})");
             Ok(())
         }
         "tcp-client" => {
@@ -1227,4 +1324,290 @@ fn test_dual_stack_tcp_v4_echo() -> Result<(), String> {
     client.join().map_err(|_| "client thread panicked".to_string())?;
 
     Ok(())
+}
+
+// binding a dual-stack socket to :: after an IPv4 address is bound to the
+// same port must fail (the dual-stack socket covers the IPv4 side too)
+fn test_dual_stack_bind_conflict_v4_first() -> Result<(), String> {
+    let fd_v4 = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    let fd_v6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if fd_v4 < 0 || fd_v6 < 0 {
+        return Err(format!(
+            "socket(): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let addr_v4 = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_DUAL_UDP_SENDTO.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let addr_v6 = sockaddr_in6(ipv6_unspecified(), PORT_DUAL_UDP_SENDTO);
+
+    run_and_close_fds(&[fd_v4, fd_v6], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_v4,
+                &addr_v4 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr_v4) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!(
+                "bind(127.0.0.1): {} ({})",
+                get_errno(),
+                test_utils::get_errno_message(get_errno()),
+            ));
+        }
+
+        let rv = unsafe {
+            libc::bind(
+                fd_v6,
+                &addr_v6 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr_v6) as libc::socklen_t,
+            )
+        };
+        errno_is(rv, Some(libc::EADDRINUSE)).map_err(|e| format!("bind(::) over 127.0.0.1: {e}"))
+    })
+}
+
+// an IPv6-only socket and an IPv4 socket can bind the same port
+fn test_v6only_bind_no_conflict_with_v4() -> Result<(), String> {
+    let fd_v6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    let fd_v4 = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd_v6 < 0 || fd_v4 < 0 {
+        return Err(format!(
+            "socket(): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let v6only: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd_v6,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &v6only as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&v6only) as libc::socklen_t,
+        )
+    };
+
+    let addr_v6 = sockaddr_in6(ipv6_unspecified(), PORT_V6ONLY_ISOLATION);
+    let addr_v4 = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_V6ONLY_ISOLATION.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_ANY.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
+    run_and_close_fds(&[fd_v6, fd_v4], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_v6,
+                &addr_v6 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr_v6) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!(
+                "bind(::) with V6ONLY: {} ({})",
+                get_errno(),
+                test_utils::get_errno_message(get_errno()),
+            ));
+        }
+
+        let rv = unsafe {
+            libc::bind(
+                fd_v4,
+                &addr_v4 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr_v4) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!(
+                "bind(0.0.0.0) over V6ONLY :: on the same port: {} ({})",
+                get_errno(),
+                test_utils::get_errno_message(get_errno()),
+            ));
+        }
+        Ok(())
+    })
+}
+
+// an IPv6-only socket must not receive IPv4 traffic
+fn test_v6only_no_v4_traffic() -> Result<(), String> {
+    let fd_v6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    let fd_v4 = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd_v6 < 0 || fd_v4 < 0 {
+        return Err(format!(
+            "socket(): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let v6only: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd_v6,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &v6only as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&v6only) as libc::socklen_t,
+        )
+    };
+
+    let addr_v6 = sockaddr_in6(ipv6_unspecified(), PORT_V6ONLY_ISOLATION);
+    let dst_v4 = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_V6ONLY_ISOLATION.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
+    run_and_close_fds(&[fd_v6, fd_v4], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_v6,
+                &addr_v6 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&addr_v6) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!(
+                "bind(::) with V6ONLY: {} ({})",
+                get_errno(),
+                test_utils::get_errno_message(get_errno()),
+            ));
+        }
+
+        let payload = b"must not be received";
+        let n = unsafe {
+            libc::sendto(
+                fd_v4,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+                0,
+                &dst_v4 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&dst_v4) as libc::socklen_t,
+            )
+        };
+        if n as usize != payload.len() {
+            return Err(format!("sendto sent {n} of {} bytes", payload.len()));
+        }
+
+        // non-blocking receive: the datagram must not have been delivered
+        let mut buf = [0u8; 64];
+        let mut src: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut src_len = std::mem::size_of_val(&src) as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                fd_v6,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+                &mut src as *mut _ as *mut libc::sockaddr,
+                &mut src_len,
+            )
+        };
+        errno_is(n.try_into().unwrap_or(-1), Some(libc::EWOULDBLOCK))
+            .map_err(|e| format!("recvfrom on V6ONLY socket after IPv4 send: {e}"))
+    })
+}
+
+// a dual-stack socket can sendto an explicit IPv4 address; an IPv4 receiver
+// sees the source as a plain IPv4 address (no IPv4-mapped representation on
+// the simulated network)
+fn test_dual_stack_udp_sendto_v4() -> Result<(), String> {
+    let fd_dual = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    let fd_v4 = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd_dual < 0 || fd_v4 < 0 {
+        return Err(format!(
+            "socket(): {} ({})",
+            get_errno(),
+            test_utils::get_errno_message(get_errno()),
+        ));
+    }
+
+    let dst_v4 = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: PORT_DUAL_UDP_SENDTO.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
+    run_and_close_fds(&[fd_dual, fd_v4], || {
+        let rv = unsafe {
+            libc::bind(
+                fd_v4,
+                &dst_v4 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&dst_v4) as libc::socklen_t,
+            )
+        };
+        if rv != 0 {
+            return Err(format!(
+                "bind(127.0.0.1): {} ({})",
+                get_errno(),
+                test_utils::get_errno_message(get_errno()),
+            ));
+        }
+
+        let payload = b"dual-stack sendto v4";
+        let n = unsafe {
+            libc::sendto(
+                fd_dual,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+                0,
+                &dst_v4 as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(&dst_v4) as libc::socklen_t,
+            )
+        };
+        if n as usize != payload.len() {
+            return Err(format!("sendto sent {n} of {} bytes", payload.len()));
+        }
+
+        let mut buf = [0u8; 64];
+        let mut src: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut src_len = std::mem::size_of_val(&src) as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                fd_v4,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut src as *mut _ as *mut libc::sockaddr,
+                &mut src_len,
+            )
+        };
+        if n as usize != payload.len() {
+            return Err(format!("recvfrom received {n} of {} bytes", payload.len()));
+        }
+        if &buf[..n as usize] != payload {
+            return Err("recvfrom data mismatch".to_string());
+        }
+        // the source must be a plain IPv4 address, not IPv4-mapped
+        if std::net::Ipv4Addr::from(u32::from_be(src.sin_addr.s_addr))
+            != std::net::Ipv4Addr::LOCALHOST
+        {
+            return Err(format!(
+                "recvfrom source is {}, expected 127.0.0.1",
+                std::net::Ipv4Addr::from(u32::from_be(src.sin_addr.s_addr))
+            ));
+        }
+        Ok(())
+    })
 }

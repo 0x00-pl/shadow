@@ -1,0 +1,20 @@
+general:
+  stop_time: 10 s
+network:
+  graph:
+    type: 1_gbit_switch
+hosts:
+  server:
+    network_node_id: 0
+    processes:
+    - path: ../../target/debug/test_ipv6
+      args: "tcp-server 21003"
+      start_time: 1 s
+  client:
+    network_node_id: 0
+    processes:
+    - path: ../../target/debug/test_ipv6
+      # a dual-stack IPv6 socket connecting to the server's IPv4 address
+      # (resolved via getaddrinfo) as an IPv4-mapped destination
+      args: "dual-tcp-client 21003"
+      start_time: 2 s

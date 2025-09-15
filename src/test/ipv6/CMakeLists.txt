@@ -17,3 +17,9 @@ add_shadow_tests(
     BASENAME ipv6-tcp-two-hosts
     SHADOW_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/tcp-two-hosts.yaml"
     ARGS --strace-logging-mode off)
+
+# a dual-stack IPv6 socket connecting to an IPv4 peer across hosts
+add_shadow_tests(
+    BASENAME ipv6-dual-tcp-two-hosts
+    SHADOW_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/dual-tcp-two-hosts.yaml"
+    ARGS --strace-logging-mode off)
